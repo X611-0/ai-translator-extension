@@ -10,6 +10,9 @@ const Popup: React.FC = () => {
   const [outputMode, setOutputMode] = useState<OutputMode>('both');
   const [subtitleCount, setSubtitleCount] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [ttsSpeed, setTtsSpeed] = useState(0);      // 语速 -500~500
+  const [ttsVolume, setTtsVolume] = useState(80);   // 音量 0~100
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   // 检查状态
   useEffect(() => {
@@ -137,6 +140,89 @@ const Popup: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {/* 高级设置折叠 */}
+      {(outputMode === 'speech' || outputMode === 'both') && (
+        <div className="space-y-2">
+          <button
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            className="flex items-center space-x-1 text-xs text-gray-400 hover:text-gray-300"
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              className={`transform transition-transform ${showAdvanced ? 'rotate-90' : ''}`}
+            >
+              <polyline points="9,18 15,12 9,6" />
+            </svg>
+            <span>语音设置</span>
+          </button>
+
+          {showAdvanced && (
+            <div className="space-y-3 bg-gray-800 rounded-lg p-3">
+              {/* 语速控制 */}
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs">
+                  <span className="text-gray-400">语速</span>
+                  <span className="text-gray-200">
+                    {ttsSpeed === 0 ? '正常' : ttsSpeed > 0 ? `+${ttsSpeed}` : ttsSpeed}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="-500"
+                  max="500"
+                  value={ttsSpeed}
+                  onChange={(e) => {
+                    const value = parseInt(e.target.value);
+                    setTtsSpeed(value);
+                    chrome.runtime.sendMessage({
+                      type: 'UPDATE_TTS_SETTINGS',
+                      payload: { speed: value },
+                    });
+                  }}
+                  className="w-full h-1.5 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                />
+                <div className="flex justify-between text-xs text-gray-500">
+                  <span>慢</span>
+                  <span>快</span>
+                </div>
+              </div>
+
+              {/* 音量控制 */}
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs">
+                  <span className="text-gray-400">音量</span>
+                  <span className="text-gray-200">{ttsVolume}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={ttsVolume}
+                  onChange={(e) => {
+                    const value = parseInt(e.target.value);
+                    setTtsVolume(value);
+                    chrome.runtime.sendMessage({
+                      type: 'UPDATE_TTS_SETTINGS',
+                      payload: { volume: value },
+                    });
+                  }}
+                  className="w-full h-1.5 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                />
+                <div className="flex justify-between text-xs text-gray-500">
+                  <span>静音</span>
+                  <span>最大</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 控制按钮 */}
       <div className="space-y-2">
