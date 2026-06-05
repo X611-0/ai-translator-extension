@@ -46,8 +46,13 @@ export interface LanguageSettings {
 export interface RecognitionResult {
   text: string;
   isEnd: boolean;
+  isPartial: boolean;       // 是否中间结果
   segmentId: number;
   timestamp: number;
+  confidence?: number;       // 置信度 0-1
+  language?: string;         // 识别语种
+  latency?: number;          // 延迟(ms)
+  sn?: number;               // 序号
 }
 
 // ========== 翻译结果 ==========

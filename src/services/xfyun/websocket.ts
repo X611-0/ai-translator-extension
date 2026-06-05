@@ -1,35 +1,50 @@
 /**
  * 讯飞语音识别WebSocket签名工具
+ * 基于 HMAC-SHA256 签名算法
  */
 
 import CryptoJS from 'crypto-js';
 
-export function generateXFYunSignature(
-  apiKey: string,
-  apiSecret: string,
-  host: string,
-  path: string
-): string {
-  const date = new Date().toUTCString();
-  const httpMethod = 'GET';
-  const signatureOrigin = `host: ${host}\ndate: ${date}\n${httpMethod} ${path} HTTP/1.1`;
+export interface SignatureResult {
+  signature: string;
+  authorization: string;
+  date: string;
+}
 
-  // HMAC-SHA256签名
+/**
+ * 生成讯飞API签名
+ */
+export function generateSignature(
+  apiKey: string,
+  apiSecret: string
+): SignatureResult {
+  const host = 'iat-api.xfyun.cn';
+  const path = '/v2/iat';
+  const date = new Date().toUTCString();
+
+  // 签名原文
+  const signatureOrigin = `host: ${host}\ndate: ${date}\nGET ${path} HTTP/1.1`;
+
+  // HMAC-SHA256 签名
   const signature = CryptoJS.enc.Base64.stringify(
     CryptoJS.HmacSHA256(signatureOrigin, apiSecret)
   );
 
-  // 构建鉴权header
+  // Authorization header
   const authorizationOrigin = `api_key="${apiKey}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
   const authorization = CryptoJS.enc.Base64.stringify(
     CryptoJS.enc.Utf8.parse(authorizationOrigin)
   );
 
-  return `host=${encodeURIComponent(host)}&date=${encodeURIComponent(date)}&authorization=${encodeURIComponent(authorization)}`;
+  return {
+    signature,
+    authorization,
+    date,
+  };
 }
 
 /**
- * 用于WebSocket连接时的URL参数构建
+ * 构建WebSocket连接URL
  */
 export function buildWebSocketUrl(
   appId: string,
@@ -38,13 +53,20 @@ export function buildWebSocketUrl(
 ): string {
   const host = 'iat-api.xfyun.cn';
   const path = '/v2/iat';
-  const signature = generateXFYunSignature(apiKey, apiSecret, host, path);
+  const { authorization, date } = generateSignature(apiKey, apiSecret);
 
-  return `wss://${host}${path}?authorization=${signature}&date=${new Date().toUTCString()}&host=${host}`;
+  const params = new URLSearchParams({
+    host,
+    date,
+    authorization,
+    appid: appId,
+  });
+
+  return `wss://${host}${path}?${params.toString()}`;
 }
 
 /**
- * 数组转Base64
+ * ArrayBuffer 转 Base64
  */
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
@@ -53,4 +75,16 @@ export function arrayBufferToBase64(buffer: ArrayBuffer): string {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
+}
+
+/**
+ * Base64 转 ArrayBuffer
+ */
+export function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
 }
