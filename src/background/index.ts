@@ -1,5 +1,5 @@
 import { ExtensionMessage, AppSettings } from '@/types';
-import { AudioCapture } from './audioCapture';
+import { AudioCapture, CaptureResult, CaptureError } from './audioCapture';
 import { MessageHandler } from './messageHandler';
 
 // ========== 全局状态 ==========
@@ -71,7 +71,6 @@ async function startTranslation(tabId: number): Promise<void> {
   }
 
   currentTabId = tabId;
-  isRunning = true;
 
   // 获取配置
   const settings = (await chrome.storage.sync.get('appSettings')) as {
@@ -88,14 +87,46 @@ async function startTranslation(tabId: number): Promise<void> {
 
   // 启动音频捕获
   audioCapture = new AudioCapture();
-  await audioCapture.startCapture(tabId);
+  const result: CaptureResult = await audioCapture.startCapture(tabId);
+
+  if (!result.success) {
+    audioCapture = null;
+    switch (result.error) {
+      case CaptureError.PERMISSION_DENIED:
+        throw new Error('音频捕获权限被拒绝，请在Chrome扩展设置中授权');
+      case CaptureError.NO_AUDIO:
+        throw new Error('该页面没有可捕获的音频，请确保页面正在播放媒体');
+      case CaptureError.ALREADY_CAPTURING:
+        throw new Error('音频捕获已在进行中');
+      case CaptureError.NOT_SUPPORTED:
+        throw new Error('当前浏览器不支持音频捕获');
+      default:
+        throw new Error(result.message || '音频捕获启动失败');
+    }
+  }
 
   // 监听音频数据
-  audioCapture.onAudioData((audioData: ArrayBuffer) => {
+  audioCapture.onAudioData((audioData: ArrayBuffer, analysis) => {
+    if (!isRunning) return;
+
+    // 过滤静音段（避免发送无意义数据）
+    if (analysis.isSilent) {
+      console.log('[Background] 检测到静音，跳过');
+      return;
+    }
+
+    console.log('[Background] 音频数据:', {
+      rms: analysis.rms.toFixed(4),
+      peak: analysis.peak.toFixed(4),
+      length: audioData.byteLength
+    });
+
     if (messageHandler) {
       messageHandler.onAudioData(audioData, appSettings);
     }
   });
+
+  isRunning = true;
 
   // 通知content script开始翻译
   chrome.tabs.sendMessage(tabId, {
