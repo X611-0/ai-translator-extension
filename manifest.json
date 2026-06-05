@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "AI同声传译助手",
+  "version": "1.0.0",
+  "description": "实时翻译外语视频和音频，支持字幕和语音播报",
+  "permissions": [
+    "tabCapture",
+    "storage",
+    "activeTab",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "wss://*.xfyun.cn/*"
+  ],
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/index.ts"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "src/popup/index.html",
+    "default_title": "AI同声传译助手",
+    "default_icon": {
+      "16": "public/icon-16.svg",
+      "48": "public/icon-48.svg",
+      "128": "public/icon-128.svg"
+    }
+  },
+  "options_page": "src/options/index.html",
+  "icons": {
+    "16": "public/icon-16.svg",
+    "48": "public/icon-48.svg",
+    "128": "public/icon-128.svg"
+  }
+}
