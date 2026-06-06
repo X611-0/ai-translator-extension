@@ -15,10 +15,15 @@ export default defineConfig({
     },
   },
   build: {
+    // 禁用 modulepreload polyfill（service worker 没有 document）
+    modulePreload: {
+      polyfill: false,
+    },
     rollupOptions: {
       input: {
         popup: process.cwd() + '/src/popup/index.html',
         options: process.cwd() + '/src/options/index.html',
+        offscreen: process.cwd() + '/src/background/offscreen.html',
       },
     },
   },

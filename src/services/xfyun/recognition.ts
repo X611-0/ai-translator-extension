@@ -111,9 +111,9 @@ export class XFYunRecognition {
       throw err;
     }
 
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       try {
-        const url = buildWebSocketUrl(
+        const url = await buildWebSocketUrl(
           this.config.appId,
           this.config.apiKey,
           this.config.apiSecret

@@ -97,6 +97,7 @@ export interface TranslationStats {
 export type MessageType =
   | 'START_TRANSLATION'
   | 'STOP_TRANSLATION'
+  | 'FORCE_CLEANUP'
   | 'RECOGNITION_RESULT'
   | 'TRANSLATION_RESULT'
   | 'STATUS_UPDATE'

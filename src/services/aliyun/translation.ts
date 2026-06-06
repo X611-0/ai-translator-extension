@@ -1,9 +1,9 @@
 /**
  * 阿里云机器翻译 API 封装
  * 支持批量翻译优化、缓存、去重、上下文感知
+ * 使用 Web Crypto API（兼容 Service Worker）
  */
 
-import CryptoJS from 'crypto-js';
 import { AliyunConfig, TranslationResult } from '@/types';
 
 // API 配置
@@ -115,21 +115,37 @@ function buildStringToSign(method: string, canonicalized: string): string {
 }
 
 /**
- * 计算签名
+ * 计算签名（使用 Web Crypto API）
  */
-function calculateSignature(stringToSign: string, secret: string): string {
-  const hmac = CryptoJS.HmacSHA1(stringToSign, secret + '&');
-  return CryptoJS.enc.Base64.stringify(hmac);
+async function calculateSignature(stringToSign: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(secret + '&');
+  const messageData = encoder.encode(stringToSign);
+
+  // 导入密钥
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+
+  // 签名
+  const signature = await crypto.subtle.sign('HMAC', key, messageData);
+
+  // 转换为 Base64
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
 }
 
 /**
  * 构造请求 URL
  */
-function buildRequestUrl(
+async function buildRequestUrl(
   config: AliyunConfig,
   action: string,
   params: Record<string, string>
-): string {
+): Promise<string> {
   const now = new Date();
   const timestamp = now.toISOString().replace(/\.\d{3}/, '');
 
@@ -147,7 +163,7 @@ function buildRequestUrl(
 
   const canonicalized = canonicalize(allParams);
   const stringToSign = buildStringToSign('GET', canonicalized);
-  const signature = calculateSignature(stringToSign, config.accessKeySecret);
+  const signature = await calculateSignature(stringToSign, config.accessKeySecret);
 
   allParams.Signature = signature;
 
@@ -303,7 +319,7 @@ export async function translateSingle(
     params.Context = context;
   }
 
-  const url = buildRequestUrl(config, ACTION_GENERAL, params);
+  const url = await buildRequestUrl(config, ACTION_GENERAL, params);
 
   stats.totalRequests++;
   stats.totalCharacters += text.length;
@@ -404,7 +420,7 @@ export async function translateBatch(
     params.Context = context;
   }
 
-  const url = buildRequestUrl(config, ACTION_BATCH, params);
+  const url = await buildRequestUrl(config, ACTION_BATCH, params);
 
   stats.totalRequests++;
   stats.totalCharacters += batchTexts.reduce((sum, t) => sum + t.length, 0);
@@ -508,7 +524,7 @@ async function processBatchQueue(
   sourceLanguage: string,
   targetLanguage: string,
   useContext: boolean
-): void {
+): Promise<void> {
   if (batchQueue.length === 0) return;
 
   const items = batchQueue.slice();
@@ -555,7 +571,7 @@ async function processBatchQueue(
  * 获取翻译配额
  */
 export async function getQuota(config: AliyunConfig): Promise<{ total: number; used: number; remaining: number }> {
-  const url = buildRequestUrl(config, ACTION_GET_QUOTA, {});
+  const url = await buildRequestUrl(config, ACTION_GET_QUOTA, {});
 
   try {
     const response = await fetch(url);

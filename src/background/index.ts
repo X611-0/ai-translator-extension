@@ -1,21 +1,63 @@
 import { ExtensionMessage, AppSettings } from '@/types';
-import { AudioCapture, CaptureResult, CaptureError } from './audioCapture';
+import { setupOffscreenDocument, closeOffscreenDocument } from './offscreenManager';
 import { MessageHandler } from './messageHandler';
 
 // ========== 全局状态 ==========
-let audioCapture: AudioCapture | null = null;
-let messageHandler: MessageHandler | null = null;
+let messageHandler: any = null;
 let isRunning = false;
 let currentTabId: number | null = null;
-
-// ========== 初始化 ==========
-messageHandler = new MessageHandler();
+let appSettings: AppSettings | null = null;
+let lastCaptureTabId: number | null = null; // 记录上次捕获的标签页
 
 // ========== 监听来自popup和content的消息 ==========
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendResponse) => {
-  handleMessage(message, sender).then(sendResponse);
-  return true; // 异步响应
+  handleMessage(message, sender).then(sendResponse).catch((err) => {
+    sendResponse({ success: false, error: err.message });
+  });
+  return true;
 });
+
+// 监听来自离屏文档的音频数据
+chrome.runtime.onMessage.addListener((message: any) => {
+  if (message.type === 'OFFSCREEN_AUDIO_DATA') {
+    handleAudioData(message.audioData, message.analysis);
+  }
+  return false; // 不需要响应
+});
+
+// 扩展安装/更新时清理残留状态
+chrome.runtime.onInstalled.addListener(() => {
+  console.log('[Background] 扩展已安装/更新，清理残留状态');
+  forceCleanup();
+});
+
+// Service Worker 启动时清理
+chrome.runtime.onStartup.addListener(() => {
+  console.log('[Background] Service Worker 启动，清理残留状态');
+  forceCleanup();
+});
+
+/**
+ * 强制清理所有残留状态
+ */
+async function forceCleanup(): Promise<void> {
+  isRunning = false;
+  lastCaptureTabId = null;
+
+  // 关闭离屏文档
+  try {
+    await closeOffscreenDocument();
+  } catch {
+    // 忽略
+  }
+
+  if (messageHandler) {
+    messageHandler.cleanup();
+    messageHandler = null;
+  }
+
+  console.log('[Background] 强制清理完成');
+}
 
 async function handleMessage(
   message: ExtensionMessage,
@@ -25,11 +67,14 @@ async function handleMessage(
 
   switch (type) {
     case 'START_TRANSLATION': {
-      const tabId = sender.tab?.id;
+      const payloadTabId = (payload as any)?.tabId;
+      const streamId = (payload as any)?.streamId;
+      const tabId = payloadTabId || sender.tab?.id;
       if (!tabId) return { success: false, error: '无法获取标签页' };
+      if (!streamId) return { success: false, error: '缺少音频流ID' };
 
       try {
-        await startTranslation(tabId);
+        await startTranslation(tabId, streamId);
         return { success: true };
       } catch (err: any) {
         return { success: false, error: err.message };
@@ -38,6 +83,11 @@ async function handleMessage(
 
     case 'STOP_TRANSLATION': {
       await stopTranslation();
+      return { success: true };
+    }
+
+    case 'FORCE_CLEANUP': {
+      await forceCleanup();
       return { success: true };
     }
 
@@ -64,8 +114,10 @@ async function handleMessage(
   }
 }
 
-// ========== 开始翻译 ==========
-async function startTranslation(tabId: number): Promise<void> {
+/**
+ * 启动翻译
+ */
+async function startTranslation(tabId: number, streamId: string): Promise<void> {
   if (isRunning) {
     await stopTranslation();
   }
@@ -76,7 +128,7 @@ async function startTranslation(tabId: number): Promise<void> {
   const settings = (await chrome.storage.sync.get('appSettings')) as {
     appSettings?: AppSettings;
   };
-  const appSettings = settings.appSettings;
+  appSettings = settings.appSettings || null;
 
   if (!appSettings?.xfyun?.appId) {
     throw new Error('请先在设置中配置讯飞语音识别');
@@ -85,69 +137,82 @@ async function startTranslation(tabId: number): Promise<void> {
     throw new Error('请先在设置中配置阿里云翻译');
   }
 
-  // 启动音频捕获
-  audioCapture = new AudioCapture();
-  const result: CaptureResult = await audioCapture.startCapture(tabId);
+  // 创建离屏文档进行音频处理
+  await setupOffscreenDocument();
 
-  if (!result.success) {
-    audioCapture = null;
-    switch (result.error) {
-      case CaptureError.PERMISSION_DENIED:
-        throw new Error('音频捕获权限被拒绝，请在Chrome扩展设置中授权');
-      case CaptureError.NO_AUDIO:
-        throw new Error('该页面没有可捕获的音频，请确保页面正在播放媒体');
-      case CaptureError.ALREADY_CAPTURING:
-        throw new Error('音频捕获已在进行中');
-      case CaptureError.NOT_SUPPORTED:
-        throw new Error('当前浏览器不支持音频捕获');
-      default:
-        throw new Error(result.message || '音频捕获启动失败');
-    }
+  // 通知离屏文档开始处理音频
+  const response = await chrome.runtime.sendMessage({
+    type: 'OFFSCREEN_START_PROCESSING',
+    target: 'offscreen',
+    streamId,
+    tabId,
+  });
+
+  if (!response?.success) {
+    throw new Error(response?.error || '音频处理启动失败');
   }
 
-  // 监听音频数据
-  audioCapture.onAudioData((audioData: ArrayBuffer, analysis) => {
-    if (!isRunning) return;
-
-    // 过滤静音段（避免发送无意义数据）
-    if (analysis.isSilent) {
-      console.log('[Background] 检测到静音，跳过');
-      return;
-    }
-
-    console.log('[Background] 音频数据:', {
-      rms: analysis.rms.toFixed(4),
-      peak: analysis.peak.toFixed(4),
-      length: audioData.byteLength
-    });
-
-    if (messageHandler) {
-      messageHandler.onAudioData(audioData, appSettings);
-    }
-  });
+  // 初始化消息处理器（静态导入）
+  messageHandler = new MessageHandler();
 
   isRunning = true;
 
-  // 通知content script开始翻译
+  // 通知 content script
   chrome.tabs.sendMessage(tabId, {
     type: 'STATUS_UPDATE',
     payload: { isRunning: true, status: 'translating' },
-  });
+  }).catch(() => {});
 
-  console.log('[Background] 翻译已启动, tabId:', tabId);
+  console.log('[Background] 翻译已启动, tabId:', tabId, 'streamId:', streamId);
 }
 
-// ========== 停止翻译 ==========
+/**
+ * 处理来自离屏文档的音频数据
+ */
+function handleAudioData(audioData: ArrayBuffer, analysis: any): void {
+  if (!isRunning || !messageHandler || !appSettings) return;
+
+  // 过滤静音
+  if (analysis?.isSilent) {
+    console.log('[Background] 检测到静音，跳过');
+    return;
+  }
+
+  console.log('[Background] 音频数据:', {
+    rms: analysis?.rms?.toFixed(4),
+    peak: analysis?.peak?.toFixed(4),
+    length: audioData.byteLength,
+  });
+
+  messageHandler.onAudioData(audioData, appSettings);
+}
+
+/**
+ * 停止翻译
+ */
 async function stopTranslation(): Promise<void> {
   isRunning = false;
 
-  if (audioCapture) {
-    audioCapture.stopCapture();
-    audioCapture = null;
+  // 通知离屏文档停止
+  try {
+    await chrome.runtime.sendMessage({
+      type: 'OFFSCREEN_STOP_PROCESSING',
+      target: 'offscreen',
+    });
+  } catch (err) {
+    // 忽略错误
+  }
+
+  // 关闭离屏文档
+  try {
+    await closeOffscreenDocument();
+  } catch (err) {
+    // 忽略错误
   }
 
   if (messageHandler) {
     messageHandler.cleanup();
+    messageHandler = null;
   }
 
   if (currentTabId) {

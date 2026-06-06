@@ -18,6 +18,16 @@
     "service_worker": "src/background/index.ts",
     "type": "module"
   },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/background/offscreen.html",
+        "audio-worklet-processor.js",
+        "assets/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],

@@ -1,9 +1,9 @@
 /**
  * 阿里云 TTS (文本转语音) API 封装
  * 支持音频队列管理、并发控制、语音参数调节
+ * 使用 Web Crypto API（兼容 Service Worker）
  */
 
-import CryptoJS from 'crypto-js';
 import { AliyunConfig } from '@/types';
 
 // API 配置
@@ -316,21 +316,37 @@ function buildStringToSign(method: string, canonicalized: string): string {
 }
 
 /**
- * 计算签名
+ * 计算签名（使用 Web Crypto API）
  */
-function calculateSignature(stringToSign: string, secret: string): string {
-  const hmac = CryptoJS.HmacSHA1(stringToSign, secret + '&');
-  return CryptoJS.enc.Base64.stringify(hmac);
+async function calculateSignature(stringToSign: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(secret + '&');
+  const messageData = encoder.encode(stringToSign);
+
+  // 导入密钥
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+
+  // 签名
+  const signature = await crypto.subtle.sign('HMAC', key, messageData);
+
+  // 转换为 Base64
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
 }
 
 /**
  * 构造请求 URL
  */
-function buildRequestUrl(
+async function buildRequestUrl(
   config: AliyunConfig,
   action: string,
   params: Record<string, string>
-): string {
+): Promise<string> {
   const now = new Date();
   const timestamp = now.toISOString().replace(/\.\d{3}/, '');
 
@@ -348,7 +364,7 @@ function buildRequestUrl(
 
   const canonicalized = canonicalize(allParams);
   const stringToSign = buildStringToSign('GET', canonicalized);
-  const signature = calculateSignature(stringToSign, config.accessKeySecret);
+  const signature = await calculateSignature(stringToSign, config.accessKeySecret);
 
   allParams.Signature = signature;
 
@@ -377,7 +393,7 @@ export async function synthesizeSingle(
     EnableSubtitle: 'false',
   };
 
-  const url = buildRequestUrl(config, ACTION_TTS, requestParams);
+  const url = await buildRequestUrl(config, ACTION_TTS, requestParams);
 
   try {
     const response = await fetch(url);
@@ -406,7 +422,7 @@ export async function getSynthesizeResult(
   config: AliyunConfig,
   taskId: string
 ): Promise<{ status: string; audioUrl?: string; audioData?: ArrayBuffer }> {
-  const url = buildRequestUrl(config, 'GetSynthesizeResult', { TaskId: taskId });
+  const url = await buildRequestUrl(config, 'GetSynthesizeResult', { TaskId: taskId });
 
   try {
     const response = await fetch(url);
@@ -523,10 +539,10 @@ export function addBatchToQueue(
   texts: string[],
   params?: Partial<TTSParams>
 ): AudioQueueItem[] {
-  const items = texts.map(text => ({
+  const items: AudioQueueItem[] = texts.map(text => ({
     id: `tts_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
     text,
-    status: 'pending',
+    status: 'pending' as const,
     params: {
       text,
       voice: params?.voice || VOICE_MAP.default,

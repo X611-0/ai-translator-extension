@@ -1,9 +1,7 @@
 /**
  * 讯飞语音识别WebSocket签名工具
- * 基于 HMAC-SHA256 签名算法
+ * 基于 HMAC-SHA256 签名算法（使用 Web Crypto API，兼容 Service Worker）
  */
-
-import CryptoJS from 'crypto-js';
 
 export interface SignatureResult {
   signature: string;
@@ -12,12 +10,36 @@ export interface SignatureResult {
 }
 
 /**
+ * 使用 Web Crypto API 进行 HMAC-SHA256 签名
+ */
+async function hmacSha256(message: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(secret);
+  const messageData = encoder.encode(message);
+
+  // 导入密钥
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  // 签名
+  const signature = await crypto.subtle.sign('HMAC', key, messageData);
+
+  // 转换为 Base64
+  return btoa(String.fromCharCode(...new Uint8Array(signature)));
+}
+
+/**
  * 生成讯飞API签名
  */
-export function generateSignature(
+export async function generateSignature(
   apiKey: string,
   apiSecret: string
-): SignatureResult {
+): Promise<SignatureResult> {
   const host = 'iat-api.xfyun.cn';
   const path = '/v2/iat';
   const date = new Date().toUTCString();
@@ -25,16 +47,12 @@ export function generateSignature(
   // 签名原文
   const signatureOrigin = `host: ${host}\ndate: ${date}\nGET ${path} HTTP/1.1`;
 
-  // HMAC-SHA256 签名
-  const signature = CryptoJS.enc.Base64.stringify(
-    CryptoJS.HmacSHA256(signatureOrigin, apiSecret)
-  );
+  // HMAC-SHA256 签名（使用 Web Crypto API）
+  const signature = await hmacSha256(signatureOrigin, apiSecret);
 
   // Authorization header
   const authorizationOrigin = `api_key="${apiKey}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
-  const authorization = CryptoJS.enc.Base64.stringify(
-    CryptoJS.enc.Utf8.parse(authorizationOrigin)
-  );
+  const authorization = btoa(authorizationOrigin);
 
   return {
     signature,
@@ -46,14 +64,14 @@ export function generateSignature(
 /**
  * 构建WebSocket连接URL
  */
-export function buildWebSocketUrl(
+export async function buildWebSocketUrl(
   appId: string,
   apiKey: string,
   apiSecret: string
-): string {
+): Promise<string> {
   const host = 'iat-api.xfyun.cn';
   const path = '/v2/iat';
-  const { authorization, date } = generateSignature(apiKey, apiSecret);
+  const { authorization, date } = await generateSignature(apiKey, apiSecret);
 
   const params = new URLSearchParams({
     host,

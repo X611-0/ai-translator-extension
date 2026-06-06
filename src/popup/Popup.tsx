@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ExtensionMessage } from '@/types';
+import { captureTabAudioInPopup } from './audioCapturePopup';
 
 type OutputMode = 'subtitle' | 'speech' | 'both';
 type Status = 'idle' | 'capturing' | 'recognizing' | 'translating' | 'error';
@@ -35,25 +36,41 @@ const Popup: React.FC = () => {
 
   const handleStart = async () => {
     setErrorMessage(null);
+    setStatus('capturing');
+
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab?.id) {
         setErrorMessage('无法获取当前标签页');
+        setStatus('idle');
         return;
       }
 
+      // 在 popup 中捕获音频，获取 streamId（内部会先停止旧流）
+      const captureResult = await captureTabAudioInPopup(tab.id);
+      
+      if (!captureResult.success) {
+        setErrorMessage(captureResult.error || '音频捕获失败');
+        setStatus('idle');
+        return;
+      }
+
+      // 发送 streamId 给 background
       const response = await chrome.runtime.sendMessage({
         type: 'START_TRANSLATION',
+        payload: { tabId: tab.id, streamId: captureResult.streamId },
       } as ExtensionMessage);
 
       if (response?.success) {
         setIsRunning(true);
-        setStatus('capturing');
+        setStatus('translating');
       } else {
         setErrorMessage(response?.error || '启动失败');
+        setStatus('idle');
       }
     } catch (err: any) {
       setErrorMessage(err.message || '启动失败，请检查设置');
+      setStatus('idle');
     }
   };
 
