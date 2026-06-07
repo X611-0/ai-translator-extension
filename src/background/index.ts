@@ -1,6 +1,7 @@
 import { ExtensionMessage, AppSettings } from '@/types';
 import { setupOffscreenDocument, closeOffscreenDocument } from './offscreenManager';
 import { MessageHandler } from './messageHandler';
+import { DEFAULT_SETTINGS } from '@/config';
 
 // ========== 全局状态 ==========
 let messageHandler: any = null;
@@ -11,7 +12,7 @@ let lastCaptureTabId: number | null = null; // 记录上次捕获的标签页
 
 // ========== 监听来自popup和content的消息 ==========
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendResponse) => {
-  handleMessage(message, sender).then(sendResponse).catch((err) => {
+  handleMessage(message, sender).then(sendResponse).catch((err: Error) => {
     sendResponse({ success: false, error: err.message });
   });
   return true;
@@ -156,16 +157,27 @@ async function startTranslation(tabId: number, streamId: string): Promise<void> 
       // 等待脚本加载
       await new Promise(resolve => setTimeout(resolve, 200));
     }
-  } catch (err) {
+  } catch (err: unknown) {
     // 某些页面无法注入，忽略错误
     console.warn('[Background] Content script 注入检查失败:', err);
   }
 
-  // 获取配置
+  // 获取配置（使用环境变量默认值）
   const settings = (await chrome.storage.sync.get('appSettings')) as {
     appSettings?: AppSettings;
   };
-  appSettings = settings.appSettings || null;
+  // 合并默认配置，确保环境变量的值被使用
+  appSettings = {
+    ...DEFAULT_SETTINGS,
+    ...settings.appSettings,
+    xfyun: { ...DEFAULT_SETTINGS.xfyun, ...settings.appSettings?.xfyun },
+    aliyun: { ...DEFAULT_SETTINGS.aliyun, ...settings.appSettings?.aliyun },
+  };
+
+  console.log('[Background] 配置加载完成:', {
+    xfyunAppId: appSettings.xfyun.appId ? '已配置' : '未配置',
+    aliyunKeyId: appSettings.aliyun.accessKeyId ? '已配置' : '未配置',
+  });
 
   if (!appSettings?.xfyun?.appId) {
     throw new Error('请先在设置中配置讯飞语音识别');
@@ -200,7 +212,7 @@ async function startTranslation(tabId: number, streamId: string): Promise<void> 
     payload: { isRunning: true, status: 'translating' },
   }).then((resp) => {
     console.log('[Background] STATUS_UPDATE 响应:', JSON.stringify(resp));
-  }).catch((err) => {
+  }).catch((err: Error) => {
     console.warn('[Background] STATUS_UPDATE 发送失败 (content script 可能未注入):', err.message);
   });
 
@@ -234,7 +246,7 @@ function handleAudioData(audioData: number[], analysis: any): void {
     length: arrayBuffer.byteLength,
   });
 
-  messageHandler.onAudioData(arrayBuffer, appSettings).catch((err) => {
+  messageHandler.onAudioData(arrayBuffer, appSettings).catch((err: unknown) => {
     console.error('[Background] 处理音频数据失败:', err);
   });
 }
@@ -251,14 +263,14 @@ async function stopTranslation(): Promise<void> {
       type: 'OFFSCREEN_STOP_PROCESSING',
       target: 'offscreen',
     });
-  } catch (err) {
+  } catch (err: unknown) {
     // 忽略错误
   }
 
   // 关闭离屏文档
   try {
     await closeOffscreenDocument();
-  } catch (err) {
+  } catch (err: unknown) {
     // 忽略错误
   }
 
