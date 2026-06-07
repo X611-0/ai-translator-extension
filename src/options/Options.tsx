@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { AppSettings, XFYunConfig, AliyunConfig } from '@/types';
-import { DEFAULT_SETTINGS, loadSettings, saveSettings, validateXFYunConfig, validateAliyunConfig } from '@/config';
+import { AppSettings, DisplaySettings, LanguageSettings } from '@/types';
+import { DEFAULT_SETTINGS, loadSettings, saveSettings } from '@/config';
 
 const Options: React.FC = () => {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
-  const [errors, setErrors] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState<'display' | 'language'>('display');
 
   useEffect(() => {
     loadSettings().then((s) => {
@@ -16,36 +16,26 @@ const Options: React.FC = () => {
   }, []);
 
   const handleSave = async () => {
-    const xfValidation = validateXFYunConfig(settings.xfyun);
-    const aliValidation = validateAliyunConfig(settings.aliyun);
-    const allErrors = [...xfValidation.errors, ...aliValidation.errors];
-
-    if (allErrors.length > 0) {
-      setErrors(allErrors);
-      return;
-    }
-
     try {
       await saveSettings(settings);
-      setErrors([]);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
-      setErrors(['保存失败']);
+      console.error('保存失败:', err);
     }
   };
 
-  const updateXFYun = (field: keyof XFYunConfig, value: string) => {
+  const updateDisplay = (field: keyof DisplaySettings, value: any) => {
     setSettings((prev) => ({
       ...prev,
-      xfyun: { ...prev.xfyun, [field]: value },
+      display: { ...prev.display, [field]: value },
     }));
   };
 
-  const updateAliyun = (field: keyof AliyunConfig, value: string) => {
+  const updateLanguages = (field: keyof LanguageSettings, value: string) => {
     setSettings((prev) => ({
       ...prev,
-      aliyun: { ...prev.aliyun, [field]: value },
+      languages: { ...prev.languages, [field]: value },
     }));
   };
 
@@ -63,20 +53,29 @@ const Options: React.FC = () => {
         {/* 标题 */}
         <div className="border-b border-gray-700 pb-4">
           <h1 className="text-2xl font-bold">AI同声传译助手 - 设置</h1>
-          <p className="text-gray-400 text-sm mt-1">配置讯飞语音识别和阿里云翻译服务</p>
+          <p className="text-gray-400 text-sm mt-1">配置显示偏好和语言设置</p>
         </div>
 
-        {/* 错误提示 */}
-        {errors.length > 0 && (
-          <div className="bg-red-900/50 border border-red-700 rounded-lg p-4">
-            <h3 className="font-medium text-red-200">配置错误：</h3>
-            <ul className="list-disc list-inside text-sm text-red-300 mt-2">
-              {errors.map((err, i) => (
-                <li key={i}>{err}</li>
-              ))}
-            </ul>
-          </div>
-        )}
+        {/* 标签页导航 */}
+        <div className="flex space-x-2 bg-gray-800 rounded-lg p-1">
+          {[
+            { key: 'display', label: '显示设置', icon: '🎨' },
+            { key: 'language', label: '语言设置', icon: '🌐' },
+          ].map((tab) => (
+            <button
+              key={tab.key}
+              onClick={() => setActiveTab(tab.key as any)}
+              className={`flex-1 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+                activeTab === tab.key
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-gray-400 hover:text-white hover:bg-gray-700'
+              }`}
+            >
+              <span className="mr-2">{tab.icon}</span>
+              {tab.label}
+            </button>
+          ))}
+        </div>
 
         {/* 保存成功提示 */}
         {saved && (
@@ -85,112 +84,187 @@ const Options: React.FC = () => {
           </div>
         )}
 
-        {/* 讯飞配置 */}
-        <section className="bg-gray-800 rounded-xl p-5 space-y-4">
-          <div className="flex items-center space-x-3">
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-sm font-bold">
-              讯
-            </div>
-            <div>
-              <h2 className="font-semibold">讯飞语音识别</h2>
-              <a
-                href="https://www.xfyun.cn/"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-xs text-blue-400 hover:underline"
-              >
-                前往讯飞开放平台 →
-              </a>
-            </div>
-          </div>
+        {/* 显示设置 */}
+        {activeTab === 'display' && (
+          <section className="bg-gray-800 rounded-xl p-5 space-y-4">
+            <h2 className="font-semibold flex items-center space-x-2">
+              <span>🎨</span>
+              <span>字幕显示设置</span>
+            </h2>
 
-          <div className="grid gap-4">
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">AppID</label>
-              <input
-                type="text"
-                value={settings.xfyun.appId}
-                onChange={(e) => updateXFYun('appId', e.target.value)}
-                placeholder="请输入 AppID"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-              />
-            </div>
+            <div className="grid gap-4">
+              {/* 字幕位置 */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-2">字幕位置</label>
+                <div className="flex space-x-2">
+                  {[
+                    { value: 'top', label: '顶部' },
+                    { value: 'middle', label: '中间' },
+                    { value: 'bottom', label: '底部' },
+                  ].map((pos) => (
+                    <button
+                      key={pos.value}
+                      onClick={() => updateDisplay('subtitlePosition', pos.value)}
+                      className={`px-4 py-2 rounded-lg text-sm ${
+                        settings.display.subtitlePosition === pos.value
+                          ? 'bg-indigo-600 text-white'
+                          : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
+                      }`}
+                    >
+                      {pos.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">APIKey</label>
-              <input
-                type="password"
-                value={settings.xfyun.apiKey}
-                onChange={(e) => updateXFYun('apiKey', e.target.value)}
-                placeholder="请输入 APIKey"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-              />
-            </div>
+              {/* 字体大小 */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">
+                  字体大小: {settings.display.subtitleFontSize}px
+                </label>
+                <input
+                  type="range"
+                  min="12"
+                  max="32"
+                  value={settings.display.subtitleFontSize}
+                  onChange={(e) => updateDisplay('subtitleFontSize', parseInt(e.target.value))}
+                  className="w-full accent-indigo-600"
+                />
+              </div>
 
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">APISecret</label>
-              <input
-                type="password"
-                value={settings.xfyun.apiSecret}
-                onChange={(e) => updateXFYun('apiSecret', e.target.value)}
-                placeholder="请输入 APISecret"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500"
-              />
-            </div>
-          </div>
+              {/* 背景透明度 */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">
+                  背景透明度: {Math.round(settings.display.subtitleBackgroundOpacity * 100)}%
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={settings.display.subtitleBackgroundOpacity * 100}
+                  onChange={(e) => updateDisplay('subtitleBackgroundOpacity', parseInt(e.target.value) / 100)}
+                  className="w-full accent-indigo-600"
+                />
+              </div>
 
-          <p className="text-xs text-gray-500">
-            新用户有 5万次/年免费额度，足够个人使用
-          </p>
-        </section>
+              {/* 字幕颜色 */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">字幕颜色</label>
+                <div className="flex space-x-2">
+                  <input
+                    type="color"
+                    value={settings.display.subtitleColor}
+                    onChange={(e) => updateDisplay('subtitleColor', e.target.value)}
+                    className="w-10 h-10 rounded cursor-pointer"
+                  />
+                  <input
+                    type="text"
+                    value={settings.display.subtitleColor}
+                    onChange={(e) => updateDisplay('subtitleColor', e.target.value)}
+                    className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm"
+                  />
+                </div>
+              </div>
 
-        {/* 阿里云配置 */}
-        <section className="bg-gray-800 rounded-xl p-5 space-y-4">
-          <div className="flex items-center space-x-3">
-            <div className="w-8 h-8 bg-orange-600 rounded-lg flex items-center justify-center text-sm font-bold">
-              云
-            </div>
-            <div>
-              <h2 className="font-semibold">阿里云翻译</h2>
-              <a
-                href="https://help.aliyun.com/product/301.html"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-xs text-orange-400 hover:underline"
-              >
-                前往阿里云机器翻译 →
-              </a>
-            </div>
-          </div>
+              {/* 最大行数 */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">历史字幕行数</label>
+                <select
+                  value={settings.display.maxLines}
+                  onChange={(e) => updateDisplay('maxLines', parseInt(e.target.value))}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm"
+                >
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <option key={n} value={n}>{n} 行</option>
+                  ))}
+                </select>
+              </div>
 
-          <div className="grid gap-4">
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">AccessKeyId</label>
-              <input
-                type="text"
-                value={settings.aliyun.accessKeyId}
-                onChange={(e) => updateAliyun('accessKeyId', e.target.value)}
-                placeholder="请输入 AccessKeyId"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500"
-              />
+              {/* 双语模式 */}
+              <div className="flex items-center justify-between">
+                <label className="text-sm text-gray-400">显示原文（双语模式）</label>
+                <button
+                  onClick={() => updateDisplay('bilingual', !settings.display.bilingual)}
+                  className={`w-12 h-6 rounded-full transition-colors ${
+                    settings.display.bilingual ? 'bg-indigo-600' : 'bg-gray-600'
+                  }`}
+                >
+                  <div
+                    className={`w-5 h-5 bg-white rounded-full transition-transform ${
+                      settings.display.bilingual ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
             </div>
+          </section>
+        )}
 
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">AccessKeySecret</label>
-              <input
-                type="password"
-                value={settings.aliyun.accessKeySecret}
-                onChange={(e) => updateAliyun('accessKeySecret', e.target.value)}
-                placeholder="请输入 AccessKeySecret"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500"
-              />
+        {/* 语言设置 */}
+        {activeTab === 'language' && (
+          <section className="bg-gray-800 rounded-xl p-5 space-y-4">
+            <h2 className="font-semibold flex items-center space-x-2">
+              <span>🌐</span>
+              <span>语言设置</span>
+            </h2>
+
+            <div className="grid gap-4">
+              {/* 源语言 */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">源语言（识别语言）</label>
+                <select
+                  value={settings.languages.sourceLanguage}
+                  onChange={(e) => updateLanguages('sourceLanguage', e.target.value)}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm"
+                >
+                  {[
+                    { value: 'en', label: '英语' },
+                    { value: 'zh', label: '中文' },
+                    { value: 'ja', label: '日语' },
+                    { value: 'ko', label: '韩语' },
+                    { value: 'ru', label: '俄语' },
+                    { value: 'es', label: '西班牙语' },
+                    { value: 'fr', label: '法语' },
+                    { value: 'de', label: '德语' },
+                    { value: 'ar', label: '阿拉伯语' },
+                    { value: 'pt', label: '葡萄牙语' },
+                    { value: 'vi', label: '越南语' },
+                    { value: 'th', label: '泰语' },
+                  ].map((lang) => (
+                    <option key={lang.value} value={lang.value}>{lang.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* 目标语言 */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">目标语言（翻译语言）</label>
+                <select
+                  value={settings.languages.targetLanguage}
+                  onChange={(e) => updateLanguages('targetLanguage', e.target.value)}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm"
+                >
+                  {[
+                    { value: 'zh', label: '中文' },
+                    { value: 'en', label: '英语' },
+                    { value: 'ja', label: '日语' },
+                    { value: 'ko', label: '韩语' },
+                    { value: 'ru', label: '俄语' },
+                    { value: 'es', label: '西班牙语' },
+                    { value: 'fr', label: '法语' },
+                    { value: 'de', label: '德语' },
+                  ].map((lang) => (
+                    <option key={lang.value} value={lang.value}>{lang.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              <p className="text-xs text-gray-500">
+                源语言决定语音识别的语言，目标语言决定翻译结果的语言
+              </p>
             </div>
-          </div>
-
-          <p className="text-xs text-gray-500">
-            需要开通机器翻译服务，新用户有免费额度
-          </p>
-        </section>
+          </section>
+        )}
 
         {/* 保存按钮 */}
         <div className="flex space-x-4">
@@ -212,7 +286,7 @@ const Options: React.FC = () => {
         {/* 页脚 */}
         <div className="border-t border-gray-700 pt-4 text-center">
           <p className="text-xs text-gray-500">
-            AI同声传译助手 v1.0.0
+            AI同声传译助手 v1.0.0 | API已内置，可直接使用
           </p>
         </div>
       </div>

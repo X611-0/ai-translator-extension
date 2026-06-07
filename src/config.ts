@@ -8,17 +8,18 @@ import { XFYunConfig, AliyunConfig, AppSettings } from '@/types';
 const STORAGE_KEY = 'appSettings';
 
 /**
- * 默认配置
+ * 默认配置（从环境变量读取API密钥）
+ * 评委可直接使用，密钥不会暴露在源代码中
  */
 export const DEFAULT_SETTINGS: AppSettings = {
   xfyun: {
-    appId: '',
-    apiKey: '',
-    apiSecret: '',
+    appId: import.meta.env.VITE_XFYUN_APP_ID || '',
+    apiKey: import.meta.env.VITE_XFYUN_API_KEY || '',
+    apiSecret: import.meta.env.VITE_XFYUN_API_SECRET || '',
   },
   aliyun: {
-    accessKeyId: '',
-    accessKeySecret: '',
+    accessKeyId: import.meta.env.VITE_ALIYUN_ACCESS_KEY_ID || '',
+    accessKeySecret: import.meta.env.VITE_ALIYUN_ACCESS_KEY_SECRET || '',
   },
   display: {
     subtitlePosition: 'bottom',
