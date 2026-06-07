@@ -56,7 +56,7 @@ export class XFYunRecognition {
   private readonly WS_URL = 'wss://iat-api.xfyun.cn/v2/iat';
   private readonly RECONNECT_DELAY = 3000;
   private readonly HEARTBEAT_INTERVAL = 30000;
-  private readonly CONNECT_TIMEOUT = 10000;
+  private readonly CONNECT_TIMEOUT = 15000; // 增加到15秒
 
   private stats: RecognitionStats = {
     totalFrames: 0,
@@ -98,32 +98,53 @@ export class XFYunRecognition {
    * 连接服务器
    */
   async connect(): Promise<void> {
+    console.log('[XFYun] 开始连接..., 当前状态: ws=', !!this.ws, 'isConnected=', this.isConnected, 'readyState=', this.ws ? this.ws.readyState : 'N/A');
+
     if (this.ws && (this.isConnected || this.ws.readyState === WebSocket.CONNECTING)) {
       console.log('[XFYun] WebSocket已在连接中');
       return;
+    }
+
+    // 清理旧连接
+    if (this.ws) {
+      console.log('[XFYun] 清理旧的WebSocket连接');
+      try {
+        this.ws.close();
+      } catch (e) {
+        console.warn('[XFYun] 关闭旧连接失败:', e);
+      }
+      this.ws = null;
     }
 
     // 验证配置
     const validation = XFYunRecognition.validateConfig(this.config);
     if (!validation.valid) {
       const err = new Error(validation.errors.join(', '));
+      console.error('[XFYun] 配置验证失败:', validation.errors);
       this.events.onError?.(RecognitionError.INVALID_CONFIG, err.message);
       throw err;
     }
 
+    console.log('[XFYun] 配置验证通过, appId:', this.config.appId);
+
     return new Promise(async (resolve, reject) => {
       try {
+        console.log('[XFYun] 构建WebSocket URL...');
         const url = await buildWebSocketUrl(
           this.config.appId,
           this.config.apiKey,
           this.config.apiSecret
         );
 
+        console.log('[XFYun] WebSocket URL:', url.substring(0, 100) + '...');
+
         this.ws = new WebSocket(url);
         this.ws.binaryType = 'arraybuffer';
 
+        console.log('[XFYun] WebSocket 创建完成, readyState:', this.ws.readyState);
+
         this.ws.onopen = () => {
-          console.log('[XFYun] WebSocket已连接');
+          console.log('[XFYun] WebSocket已连接, readyState:', this.ws?.readyState);
           this.isConnected = true;
           this.isClosing = false;
           this.reconnectAttempts = 0;
@@ -132,22 +153,27 @@ export class XFYunRecognition {
           this.stats.startTime = this.sessionStartTime;
           this.startHeartbeat();
           this.events.onConnect?.();
+
+          // 立即发送第一帧（first=true, status=0, 包含音频参数）
+          this.sendFirstFrame();
+
           this.flushAudioQueue();
           resolve();
         };
 
         this.ws.onmessage = (event: MessageEvent) => {
+          console.log('[XFYun] 收到消息, type:', typeof event.data, 'data:', typeof event.data === 'string' ? event.data.substring(0, 200) : event.data);
           this.handleMessage(event.data);
         };
 
         this.ws.onerror = (event: Event) => {
-          console.error('[XFYun] WebSocket错误:', event);
+          console.error('[XFYun] WebSocket错误:', event, 'readyState:', this.ws?.readyState);
           this.stats.errorCount++;
           this.events.onError?.(RecognitionError.CONNECTION_FAILED, 'WebSocket连接失败');
         };
 
         this.ws.onclose = (event: CloseEvent) => {
-          console.log('[XFYun] WebSocket关闭, code:', event.code, 'reason:', event.reason);
+          console.log('[XFYun] WebSocket关闭, code:', event.code, 'reason:', event.reason, 'wasClean:', event.wasClean);
           this.isConnected = false;
           this.stopHeartbeat();
           this.events.onDisconnect?.();
@@ -170,13 +196,16 @@ export class XFYunRecognition {
         // 连接超时
         setTimeout(() => {
           if (!this.isConnected) {
+            console.error('[XFYun] 连接超时');
             this.ws?.close();
+            this.ws = null;
             this.stats.errorCount++;
             this.events.onError?.(RecognitionError.TIMEOUT, '连接超时');
             reject(new Error('连接超时'));
           }
         }, this.CONNECT_TIMEOUT);
       } catch (err) {
+        console.error('[XFYun] 连接异常:', err);
         this.stats.errorCount++;
         reject(err);
       }
@@ -187,31 +216,47 @@ export class XFYunRecognition {
    * 发送音频数据
    */
   async sendAudio(audioData: ArrayBuffer): Promise<void> {
+    console.log('[XFYun] sendAudio 调用, byteLength:', audioData.byteLength, 'ws状态:', {
+      hasWs: !!this.ws,
+      isConnected: this.isConnected,
+      readyState: this.ws ? this.ws.readyState : 'N/A',
+      queueLength: this.audioQueue.length,
+    });
+
+    // 如果 WebSocket 未初始化，先连接
     if (!this.ws) {
-      console.warn('[XFYun] WebSocket未初始化');
-      return;
+      console.log('[XFYun] WebSocket未初始化，开始连接...');
+      try {
+        await this.connect();
+      } catch (err) {
+        console.error('[XFYun] 连接失败:', err);
+        return;
+      }
+      // 连接后再次检查
+      if (!this.ws) {
+        console.error('[XFYun] 连接后 ws 仍为空');
+        return;
+      }
     }
 
     this.stats.totalFrames++;
     this.stats.totalBytes += audioData.byteLength;
 
-    if (!this.isConnected) {
+    if (!this.isConnected || !this.ws) {
+      console.warn('[XFYun] 未连接，将音频放入队列 (isConnected:', this.isConnected, ', ws:', !!this.ws, ')');
       this.audioQueue.push(audioData);
-      try {
-        await this.connect();
-      } catch {
-        console.warn('[XFYun] 重连失败，音频数据已加入队列');
-      }
       return;
     }
 
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      console.warn('[XFYun] WebSocket未就绪，当前状态:', this.ws.readyState);
+    const ws = this.ws; // 保存引用，避免 TypeScript 类型问题
+    if (ws.readyState !== WebSocket.OPEN) {
+      console.warn('[XFYun] WebSocket未就绪，当前状态:', ws.readyState, '将音频放入队列');
       this.audioQueue.push(audioData);
       return;
     }
 
     const base64 = arrayBufferToBase64(audioData);
+    // 中间帧：status=1
     const frame = {
       data: {
         status: 1,
@@ -222,10 +267,60 @@ export class XFYunRecognition {
     };
 
     try {
-      this.ws.send(JSON.stringify(frame));
+      ws.send(JSON.stringify(frame));
+      console.log('[XFYun] 已发送音频帧, byteLength:', audioData.byteLength);
     } catch (err) {
       console.error('[XFYun] 发送音频失败:', err);
       this.audioQueue.push(audioData);
+    }
+  }
+
+  /**
+   * 发送第一帧
+   */
+  private sendFirstFrame(): void {
+    console.log('[XFYun] sendFirstFrame 调用, ws:', !!this.ws);
+    if (!this.ws) {
+      console.error('[XFYun] sendFirstFrame: ws 为空');
+      return;
+    }
+
+    // 讯飞 IAT v2 第一帧格式：
+    // - common: 包含 app_id
+    // - business: 包含业务参数
+    // - data: 包含音频参数（status=0 表示第一帧）
+    // 语言设置：默认英文，可通过配置切换
+    const language = this.config.language || 'en_us';
+    console.log('[XFYun] 识别语言:', language);
+
+    const firstFrame = {
+      common: {
+        app_id: this.config.appId,
+      },
+      business: {
+        domain: 'iat',
+        language: language, // en_us=英文, zh_cn=中文
+        accent: language === 'en_us' ? '' : 'mandarin',
+        vad_eos: 3000, // 静音检测超时时间（ms），3秒静音后发送最终结果
+        dwa: 'wpgs', // 动态修正
+        ptt: 0, // 0=不添加标点, 1=添加标点（必须是整数）
+      },
+      data: {
+        status: 0,
+        format: 'audio/L16;rate=16000',
+        audio: '',
+        encoding: 'raw',
+      },
+    };
+
+    const frameStr = JSON.stringify(firstFrame);
+    console.log('[XFYun] 第一帧内容:', frameStr.substring(0, 200));
+
+    try {
+      this.ws.send(frameStr);
+      console.log('[XFYun] 已发送第一帧（status=0, app_id:', this.config.appId, '）');
+    } catch (err) {
+      console.error('[XFYun] 发送第一帧失败:', err);
     }
   }
 
@@ -333,12 +428,15 @@ export class XFYunRecognition {
       const result = response.data.result;
       const status = response.data.status;
       const sn = result.sn;
+      const pgs = result.pgs; // 修正类型：apd=追加, rpl=替换
+      const rg = result.rg;   // 替换范围
 
       // 提取识别文本
       const text = this.extractText(result);
       const now = Date.now();
       const isEnd = status === 2;
       const isPartial = status === 1;
+      const isCorrection = pgs === 'rpl'; // 是否是修正结果
 
       // 计算延迟
       let latency = 0;
@@ -363,23 +461,34 @@ export class XFYunRecognition {
       }
 
       this.stats.totalResults++;
-      this.segmentId++;
+
+      // 修正结果不增加 segmentId，保持与原句相同的 ID
+      if (!isCorrection) {
+        this.segmentId++;
+      }
 
       // 构造结果
       const recognitionResult: RecognitionResult = {
         text,
         isEnd,
         isPartial,
-        segmentId: this.segmentId,
+        segmentId: isCorrection ? this.segmentId : this.segmentId,
         timestamp: now,
         latency,
         sn,
+        pgs,
+        rg,
+        isCorrection,
       };
 
       // 触发回调
       this.callback?.(recognitionResult);
 
-      if (isPartial) {
+      if (isCorrection) {
+        console.log('[XFYun] 检测到修正:', { sn, pgs, rg, text });
+      }
+
+      if (isPartial && !isCorrection) {
         this.events.onPartialResult?.(recognitionResult);
       } else if (isEnd) {
         this.events.onFinalResult?.(recognitionResult);

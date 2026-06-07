@@ -11,6 +11,8 @@ class AudioSegmenter extends AudioWorkletProcessor {
     this.silenceThreshold = 0.01;
     this.minSpeechFrames = 8;
     this.speechFrames = 0;
+    this.silenceFrames = 0;
+    this.maxSilenceFrames = 15; // 连续静音帧数阈值，用于分段
 
     this.port.onmessage = (e) => {
       if (e.data === 'flush') {
@@ -26,20 +28,25 @@ class AudioSegmenter extends AudioWorkletProcessor {
       this.buffer.push(...input);
 
       if (!isSilent) {
+        // 有声音：添加到语音缓冲区
         this.speechBuffer.push(...input);
         this.speechFrames++;
-      } else if (this.speechFrames >= this.minSpeechFrames) {
-        const segment = new Float32Array(this.speechBuffer);
-        this.port.postMessage({
-          type: 'segment',
-          data: segment,
-          analysis: { rms, peak, isSilent }
-        });
-        this.speechBuffer = [];
-        this.speechFrames = 0;
+        this.silenceFrames = 0;
       } else {
-        this.speechBuffer = [];
-        this.speechFrames = 0;
+        // 静音：增加静音计数
+        this.silenceFrames++;
+
+        // 如果有足够的语音帧，且静音帧数达到阈值，发送分段
+        if (this.speechFrames >= this.minSpeechFrames && this.silenceFrames >= this.maxSilenceFrames) {
+          const segment = new Float32Array(this.speechBuffer);
+          this.port.postMessage({
+            type: 'segment',
+            data: segment,
+            analysis: { rms, peak, isSilent: false } // 这是语音分段，标记为非静音
+          });
+          this.speechBuffer = [];
+          this.speechFrames = 0;
+        }
       }
     }
     return true;
@@ -58,13 +65,18 @@ class AudioSegmenter extends AudioWorkletProcessor {
   }
 
   flushBuffer() {
-    if (this.buffer.length > 0) {
+    if (this.speechBuffer.length > 0 && this.speechFrames >= this.minSpeechFrames) {
+      // 发送剩余的语音数据
+      const segment = new Float32Array(this.speechBuffer);
       this.port.postMessage({
-        type: 'flush',
-        data: new Float32Array(this.buffer)
+        type: 'segment',
+        data: segment,
+        analysis: { rms: 0, peak: 0, isSilent: false }
       });
-      this.buffer = [];
     }
+    this.speechBuffer = [];
+    this.speechFrames = 0;
+    this.buffer = [];
   }
 }
 

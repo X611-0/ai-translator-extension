@@ -161,12 +161,31 @@ function detectSiteCompatibility(): void {
  * 创建字幕浮层
  */
 export function createSubtitleOverlay(settings?: Partial<DisplaySettings>): void {
-  if (document.getElementById('ai-translator-overlay')) {
-    // 已存在，更新设置
-    if (settings) {
-      updateDisplaySettings(settings);
+  // 检查是否已存在浮层（可能是之前的注入留下的）
+  const existingOverlay = document.getElementById('ai-translator-overlay');
+  if (existingOverlay) {
+    console.log('[SubtitleOverlay] 发现已存在的浮层，尝试恢复引用');
+    // 恢复模块级变量引用
+    overlayRoot = existingOverlay;
+    shadowRoot = existingOverlay.shadowRoot;
+    if (shadowRoot) {
+      currentSubtitleEl = shadowRoot.getElementById('current-subtitle');
+      historyContainer = shadowRoot.getElementById('history-container');
+      subtitleContainer = shadowRoot.querySelector('.subtitle-wrapper') as HTMLElement;
     }
-    return;
+
+    // 检查恢复是否成功
+    if (overlayRoot && shadowRoot && currentSubtitleEl && historyContainer) {
+      console.log('[SubtitleOverlay] 浮层引用恢复成功');
+      if (settings) {
+        updateDisplaySettings(settings);
+      }
+      return;
+    } else {
+      console.warn('[SubtitleOverlay] 浮层引用恢复失败，重新创建');
+      // 恢复失败，移除旧元素重新创建
+      existingOverlay.remove();
+    }
   }
 
   // 检测网站兼容性
@@ -306,7 +325,21 @@ export function createSubtitleOverlay(settings?: Partial<DisplaySettings>): void
   bindEvents(wrapper);
 
   // 添加到页面
+  if (!document.body) {
+    console.error('[SubtitleOverlay] document.body 不存在，无法添加浮层');
+    return;
+  }
   document.body.appendChild(overlayRoot);
+
+  // 验证元素引用
+  console.log('[SubtitleOverlay] 浮层创建完成:', {
+    hasOverlayRoot: !!overlayRoot,
+    hasShadowRoot: !!shadowRoot,
+    hasCurrentSubtitleEl: !!currentSubtitleEl,
+    hasHistoryContainer: !!historyContainer,
+    overlayInDOM: !!document.getElementById('ai-translator-overlay'),
+    bodyExists: !!document.body,
+  });
 
   // 更新双语按钮状态
   updateBilingualButton();
@@ -428,14 +461,47 @@ function updateBilingualButton(): void {
 }
 
 /**
+ * 检查浮层是否已就绪
+ */
+export function isOverlayReady(): boolean {
+  return !!(overlayRoot && shadowRoot && currentSubtitleEl && historyContainer);
+}
+
+/**
  * 更新字幕显示
  */
 export function updateSubtitle(entry: SubtitleEntry): void {
-  if (!currentSubtitleEl || !historyContainer) return;
+  if (!currentSubtitleEl || !historyContainer) {
+    console.warn('[SubtitleOverlay] updateSubtitle: 浮层元素未就绪', {
+      hasOverlayRoot: !!overlayRoot,
+      hasShadowRoot: !!shadowRoot,
+      hasCurrentSubtitleEl: !!currentSubtitleEl,
+      hasHistoryContainer: !!historyContainer,
+    });
+    return;
+  }
+
+  console.log('[SubtitleOverlay] updateSubtitle:', {
+    original: entry.original?.substring(0, 50),
+    translated: entry.translated?.substring(0, 50),
+    isEnd: entry.isEnd,
+    isCorrection: entry.isCorrection,
+    isVisible,
+    bilingualMode,
+  });
 
   // 更新当前字幕
   const originalEl = currentSubtitleEl.querySelector('.original-text');
   const translatedEl = currentSubtitleEl.querySelector('.translated-text');
+
+  // 处理修正动画
+  if (entry.isCorrection) {
+    // 添加修正动画类
+    currentSubtitleEl.classList.add('correction');
+    setTimeout(() => {
+      currentSubtitleEl?.classList.remove('correction');
+    }, 500);
+  }
 
   if (originalEl) {
     originalEl.textContent = entry.original;
@@ -445,37 +511,71 @@ export function updateSubtitle(entry: SubtitleEntry): void {
     } else {
       originalEl.classList.add('partial');
     }
+    // 修正时添加闪烁效果
+    if (entry.isCorrection) {
+      originalEl.classList.add('correcting');
+      setTimeout(() => originalEl.classList.remove('correcting'), 300);
+    }
+  } else {
+    console.warn('[SubtitleOverlay] .original-text 元素未找到');
   }
 
   if (translatedEl) {
-    translatedEl.textContent = entry.translated || '';
-    if (entry.translated) {
-      (translatedEl as HTMLElement).style.opacity = '1';
+    // 修正时先淡出再淡入
+    if (entry.isCorrection && entry.translated) {
+      (translatedEl as HTMLElement).style.transition = 'opacity 0.2s ease';
+      (translatedEl as HTMLElement).style.opacity = '0';
+      setTimeout(() => {
+        translatedEl.textContent = entry.translated || '';
+        (translatedEl as HTMLElement).style.opacity = '1';
+      }, 200);
     } else {
-      (translatedEl as HTMLElement).style.opacity = '0.5';
+      translatedEl.textContent = entry.translated || '';
+      if (entry.translated) {
+        (translatedEl as HTMLElement).style.opacity = '1';
+      } else {
+        (translatedEl as HTMLElement).style.opacity = '0.5';
+      }
     }
+  } else {
+    console.warn('[SubtitleOverlay] .translated-text 元素未找到');
   }
 
-  // 如果是最终结果，添加到历史记录
+  // 如果是最终结果，添加到历史记录（修正结果更新历史）
   if (entry.isEnd && entry.translated) {
-    addToHistory(entry);
+    addToHistory(entry, entry.isCorrection);
   }
 
   // 显示浮层
   if (overlayRoot && isVisible) {
     overlayRoot.style.opacity = '1';
+    console.log('[SubtitleOverlay] 浮层已设为可见, opacity:', overlayRoot.style.opacity);
+  } else if (!isVisible) {
+    console.log('[SubtitleOverlay] 浮层被隐藏 (isVisible=false)');
   }
 }
 
 /**
  * 添加字幕到历史记录
  */
-function addToHistory(entry: SubtitleEntry): void {
+function addToHistory(entry: SubtitleEntry, isCorrection?: boolean): void {
   if (!historyContainer) return;
 
   const container = historyContainer; // 类型收窄
 
-  displayedSubtitles.push(entry);
+  // 如果是修正，更新已存在的条目
+  if (isCorrection) {
+    const existingIndex = displayedSubtitles.findIndex(sub => sub.id === entry.id);
+    if (existingIndex >= 0) {
+      displayedSubtitles[existingIndex] = entry;
+    } else {
+      // 如果找不到，添加新条目
+      displayedSubtitles.push(entry);
+    }
+  } else {
+    displayedSubtitles.push(entry);
+  }
+
   if (displayedSubtitles.length > displaySettings.maxLines) {
     displayedSubtitles.shift();
   }
@@ -488,6 +588,11 @@ function addToHistory(entry: SubtitleEntry): void {
 
     if (index === displayedSubtitles.length - 1) {
       item.classList.add('latest');
+    }
+
+    // 如果是修正的条目，添加修正动画
+    if (isCorrection && sub.id === entry.id) {
+      item.classList.add('corrected');
     }
 
     const opacity = 0.4 + (index / displayedSubtitles.length) * 0.3;
@@ -972,6 +1077,34 @@ function getStyles(settings: DisplaySettings, presetName: string): string {
         opacity: 1;
         transform: translateY(0);
       }
+    }
+
+    /* 修正动画 */
+    @keyframes correctionFlash {
+      0% { background-color: rgba(255, 200, 0, 0.3); }
+      50% { background-color: rgba(255, 200, 0, 0.1); }
+      100% { background-color: transparent; }
+    }
+
+    @keyframes correctingText {
+      0% { opacity: 0.5; transform: scale(0.98); }
+      50% { opacity: 0.8; transform: scale(1.02); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    .current-subtitle.correction {
+      animation: correctionFlash 0.5s ease-out;
+    }
+
+    .original-text.correcting {
+      animation: correctingText 0.3s ease-out;
+      color: #FFD700;
+    }
+
+    .history-item.corrected {
+      animation: correctionFlash 0.5s ease-out;
+      border-left: 2px solid rgba(255, 200, 0, 0.6);
+      padding-left: 8px;
     }
 
     /* 滚动条样式 */

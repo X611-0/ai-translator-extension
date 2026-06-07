@@ -101,6 +101,12 @@ async function handleMessage(
       return { success: true };
     }
 
+    case 'CONTENT_SCRIPT_READY': {
+      const status = payload as any;
+      console.log('[Background] 📋 Content Script 状态报告:', JSON.stringify(status, null, 2));
+      return { success: true };
+    }
+
     case 'STATUS_UPDATE': {
       return {
         isRunning,
@@ -110,6 +116,7 @@ async function handleMessage(
     }
 
     default:
+      console.log('[Background] 未知消息类型:', type, payload);
       return { success: false, error: '未知消息类型' };
   }
 }
@@ -123,6 +130,36 @@ async function startTranslation(tabId: number, streamId: string): Promise<void> 
   }
 
   currentTabId = tabId;
+
+  // 确保 content script 已注入
+  try {
+    // 先尝试发送测试消息，如果失败则注入 content script
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+      console.log('[Background] Content script 已存在');
+    } catch {
+      // Content script 未注入，手动注入
+      console.log('[Background] Content script 未注入，尝试动态注入...');
+      // 从 manifest 动态读取 content_scripts 配置，避免硬编码 hash
+      const manifest = chrome.runtime.getManifest();
+      const contentScripts = manifest.content_scripts;
+      if (contentScripts && contentScripts.length > 0) {
+        const files = contentScripts[0].js || [];
+        console.log('[Background] 注入文件:', files);
+        if (files.length > 0) {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: files,
+          });
+        }
+      }
+      // 等待脚本加载
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  } catch (err) {
+    // 某些页面无法注入，忽略错误
+    console.warn('[Background] Content script 注入检查失败:', err);
+  }
 
   // 获取配置
   const settings = (await chrome.storage.sync.get('appSettings')) as {
@@ -152,8 +189,8 @@ async function startTranslation(tabId: number, streamId: string): Promise<void> 
     throw new Error(response?.error || '音频处理启动失败');
   }
 
-  // 初始化消息处理器（静态导入）
-  messageHandler = new MessageHandler();
+  // 初始化消息处理器（传入目标标签页ID）
+  messageHandler = new MessageHandler(tabId);
 
   isRunning = true;
 
@@ -161,7 +198,11 @@ async function startTranslation(tabId: number, streamId: string): Promise<void> 
   chrome.tabs.sendMessage(tabId, {
     type: 'STATUS_UPDATE',
     payload: { isRunning: true, status: 'translating' },
-  }).catch(() => {});
+  }).then((resp) => {
+    console.log('[Background] STATUS_UPDATE 响应:', JSON.stringify(resp));
+  }).catch((err) => {
+    console.warn('[Background] STATUS_UPDATE 发送失败 (content script 可能未注入):', err.message);
+  });
 
   console.log('[Background] 翻译已启动, tabId:', tabId, 'streamId:', streamId);
 }
@@ -169,8 +210,13 @@ async function startTranslation(tabId: number, streamId: string): Promise<void> 
 /**
  * 处理来自离屏文档的音频数据
  */
-function handleAudioData(audioData: ArrayBuffer, analysis: any): void {
-  if (!isRunning || !messageHandler || !appSettings) return;
+function handleAudioData(audioData: number[], analysis: any): void {
+  console.log('[Background] 收到音频数据, isRunning:', isRunning, 'messageHandler:', !!messageHandler, 'appSettings:', !!appSettings);
+
+  if (!isRunning || !messageHandler || !appSettings) {
+    console.warn('[Background] 状态不完整，跳过音频处理');
+    return;
+  }
 
   // 过滤静音
   if (analysis?.isSilent) {
@@ -178,13 +224,19 @@ function handleAudioData(audioData: ArrayBuffer, analysis: any): void {
     return;
   }
 
+  // 将普通数组转换为 ArrayBuffer
+  const uint8 = new Uint8Array(audioData);
+  const arrayBuffer = uint8.buffer;
+
   console.log('[Background] 音频数据:', {
     rms: analysis?.rms?.toFixed(4),
     peak: analysis?.peak?.toFixed(4),
-    length: audioData.byteLength,
+    length: arrayBuffer.byteLength,
   });
 
-  messageHandler.onAudioData(audioData, appSettings);
+  messageHandler.onAudioData(arrayBuffer, appSettings).catch((err) => {
+    console.error('[Background] 处理音频数据失败:', err);
+  });
 }
 
 /**

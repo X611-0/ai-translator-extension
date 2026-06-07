@@ -4,6 +4,7 @@ export interface XFYunConfig {
   appId: string;
   apiKey: string;
   apiSecret: string;
+  language?: string; // 识别语言：en_us=英文, zh_cn=中文, ja_jp=日语等
 }
 
 export interface AliyunConfig {
@@ -53,6 +54,9 @@ export interface RecognitionResult {
   language?: string;         // 识别语种
   latency?: number;          // 延迟(ms)
   sn?: number;               // 序号
+  pgs?: 'apd' | 'rpl';       // 修正类型：apd=追加, rpl=替换
+  rg?: [number, number];     // 替换范围
+  isCorrection?: boolean;    // 是否是修正结果
 }
 
 // ========== 翻译结果 ==========
@@ -72,6 +76,7 @@ export interface SubtitleEntry {
   translated: string;
   isEnd: boolean;
   timestamp: number;
+  isCorrection?: boolean;  // 是否是修正结果
 }
 
 // ========== 应用状态 ==========
@@ -103,6 +108,7 @@ export type MessageType =
   | 'STATUS_UPDATE'
   | 'UPDATE_SETTINGS'
   | 'GET_SETTINGS'
+  | 'CONTENT_SCRIPT_READY'
   | 'ERROR';
 
 export interface ExtensionMessage {
@@ -118,15 +124,18 @@ export interface XFYunResponse {
   sid: string;
   data: {
     result: {
-      sn: number;
-      ls: boolean;
-      bg: number;
-      ed: number;
+      sn: number;           // 句子序号
+      ls: boolean;          // 是否是最后一句话
+      bg: number;           // 开始时间
+      ed: number;           // 结束时间
+      pgs?: 'apd' | 'rpl';  // 修正类型：apd=追加, rpl=替换（动态修正信号）
+      rg?: [number, number]; // 替换范围 [开始词序号, 结束词序号]
       ws: Array<{
         bg: number;
         cw: Array<{
-          w: string;
-          sc: number;
+          w: string;        // 词
+          wp?: string;      // 词性
+          sc: number;       // 置信度
         }>;
       }>;
     };

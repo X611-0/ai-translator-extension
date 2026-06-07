@@ -44,15 +44,18 @@ export async function generateSignature(
   const path = '/v2/iat';
   const date = new Date().toUTCString();
 
-  // 签名原文
+  // 签名原文（注意：\n 是换行符）
   const signatureOrigin = `host: ${host}\ndate: ${date}\nGET ${path} HTTP/1.1`;
+  console.log('[WebSocket] 签名原文:', signatureOrigin.replace(/\n/g, '\\n'));
 
   // HMAC-SHA256 签名（使用 Web Crypto API）
   const signature = await hmacSha256(signatureOrigin, apiSecret);
+  console.log('[WebSocket] 签名结果:', signature);
 
   // Authorization header
   const authorizationOrigin = `api_key="${apiKey}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
   const authorization = btoa(authorizationOrigin);
+  console.log('[WebSocket] authorization:', authorization.substring(0, 100) + '...');
 
   return {
     signature,
@@ -73,21 +76,23 @@ export async function buildWebSocketUrl(
   const path = '/v2/iat';
   const { authorization, date } = await generateSignature(apiKey, apiSecret);
 
-  const params = new URLSearchParams({
-    host,
-    date,
-    authorization,
-    appid: appId,
-  });
+  // 正确 URL 编码参数
+  const encodedAuth = encodeURIComponent(authorization);
+  const encodedDate = encodeURIComponent(date);
+  const encodedHost = encodeURIComponent(host);
 
-  return `wss://${host}${path}?${params.toString()}`;
+  const url = `wss://${host}${path}?authorization=${encodedAuth}&date=${encodedDate}&host=${encodedHost}`;
+  console.log('[WebSocket] 构建的URL:', url.substring(0, 150) + '...');
+
+  return url;
 }
 
 /**
- * ArrayBuffer 转 Base64
+ * ArrayBuffer 或普通数组 转 Base64
  */
-export function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
+export function arrayBufferToBase64(buffer: ArrayBuffer | number[]): string {
+  // 如果是普通数组，先转换为 Uint8Array
+  const bytes = Array.isArray(buffer) ? new Uint8Array(buffer) : new Uint8Array(buffer);
   let binary = '';
   for (let i = 0; i < bytes.byteLength; i++) {
     binary += String.fromCharCode(bytes[i]);

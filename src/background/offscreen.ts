@@ -42,60 +42,86 @@ async function startAudioProcessing(streamId: string): Promise<any> {
     // 先停止之前的处理（确保资源释放）
     stopAudioProcessing();
 
+    console.log('[Offscreen] 开始获取音频流, streamId:', streamId);
+
     // 使用 streamId 获取 MediaStream
+    // 简化配置，避免不必要的约束
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         mandatory: {
           chromeMediaSource: 'tab',
           chromeMediaSourceId: streamId,
         },
-      },
+      } as any,
       video: false,
-    } as any);
+    });
 
     if (!mediaStream) {
       return { success: false, error: '无法获取音频流' };
     }
 
     // 检查音频轨道
-    if (mediaStream.getAudioTracks().length === 0) {
+    const audioTracks = mediaStream.getAudioTracks();
+    if (audioTracks.length === 0) {
       mediaStream.getTracks().forEach(t => t.stop());
       mediaStream = null;
       return { success: false, error: '音频流没有音频轨道' };
     }
 
+    // 打印音频轨道信息
+    const audioTrack = audioTracks[0];
+    console.log('[Offscreen] 音频轨道信息:', {
+      id: audioTrack.id,
+      kind: audioTrack.kind,
+      label: audioTrack.label,
+      enabled: audioTrack.enabled,
+      muted: audioTrack.muted,
+      readyState: audioTrack.readyState,
+      settings: audioTrack.getSettings?.(),
+    });
+
+    // 如果轨道被静音，尝试取消静音
+    if (audioTrack.muted) {
+      console.warn('[Offscreen] 音频轨道被静音，尝试取消...');
+      audioTrack.enabled = true;
+    }
+
     // 创建 AudioContext
     audioContext = new AudioContext({ sampleRate: 16000 });
-    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    console.log('[Offscreen] AudioContext 状态:', {
+      state: audioContext.state,
+      sampleRate: audioContext.sampleRate,
+    });
 
-    // 创建 GainNode 用于分流音频（一路处理，一路播放）
+    // 如果 AudioContext 是 suspended，需要 resume
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+      console.log('[Offscreen] AudioContext 已 resume，状态:', audioContext.state);
+    }
+
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    console.log('[Offscreen] MediaStreamSource 已创建');
+
+    // 创建 GainNode 用于分流音频
     const gainNode = audioContext.createGain();
     gainNode.gain.value = 1.0;
 
-    analyserNode = audioContext.createAnalyser();
-    analyserNode.fftSize = 2048;
-    analyserNode.smoothingTimeConstant = 0.8;
-
     // 连接音频图：
-    // sourceNode -> gainNode -> analyserNode -> workletNode (处理)
+    // sourceNode -> gainNode -> workletNode (处理)
     // gainNode -> audioContext.destination (播放，让用户听到原视频声音)
-    sourceNode.connect(gainNode);
-    gainNode.connect(analyserNode);
+    sourceNode!.connect(gainNode);
     gainNode.connect(audioContext.destination); // 播放音频
 
     // 注册 AudioWorklet
-    // 使用 public 目录下的 JS 文件（Vite 不处理，直接复制）
     await audioContext.audioWorklet.addModule(
       chrome.runtime.getURL('audio-worklet-processor.js')
     );
 
     workletNode = new AudioWorkletNode(audioContext, 'audio-segmenter');
-
-    // analyserNode 已经连接到 gainNode，现在连接到 workletNode
-    analyserNode.connect(workletNode);
+    gainNode.connect(workletNode!);
 
     // 处理音频分段
-    workletNode.port.onmessage = (event) => {
+    workletNode!.port.onmessage = (event) => {
       const { type, data, analysis } = event.data;
       if (type === 'segment' && data.length > 0) {
         // 转换为 PCM16
@@ -105,10 +131,13 @@ async function startAudioProcessing(streamId: string): Promise<any> {
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
         }
 
+        // 转换为普通数组（Chrome sendMessage 可以正确序列化）
+        const audioArray = Array.from(new Uint8Array(pcm16.buffer));
+
         // 发送回 background
         chrome.runtime.sendMessage({
           type: 'OFFSCREEN_AUDIO_DATA',
-          audioData: pcm16.buffer,
+          audioData: audioArray,
           analysis,
         }).catch(() => {});
       }
