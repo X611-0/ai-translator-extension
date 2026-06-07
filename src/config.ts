@@ -13,13 +13,14 @@ const STORAGE_KEY = 'appSettings';
  */
 export const DEFAULT_SETTINGS: AppSettings = {
   xfyun: {
-    appId: import.meta.env.VITE_XFYUN_APP_ID || '',
-    apiKey: import.meta.env.VITE_XFYUN_API_KEY || '',
-    apiSecret: import.meta.env.VITE_XFYUN_API_SECRET || '',
+    appId: '',
+    apiKey: '',
+    apiSecret: '',
   },
   aliyun: {
-    accessKeyId: import.meta.env.VITE_ALIYUN_ACCESS_KEY_ID || '',
-    accessKeySecret: import.meta.env.VITE_ALIYUN_ACCESS_KEY_SECRET || '',
+    accessKeyId: '',
+    accessKeySecret: '',
+    ttsAppKey: '',
   },
   display: {
     subtitlePosition: 'bottom',

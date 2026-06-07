@@ -11,7 +11,16 @@ let appSettings: AppSettings | null = null;
 let lastCaptureTabId: number | null = null; // 记录上次捕获的标签页
 
 // ========== 监听来自popup和content的消息 ==========
-chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: any, sender, sendResponse) => {
+  // 跳过离屏文档和内部消息，由专门的监听器处理
+  if (message.type && (message.type.startsWith('OFFSCREEN_') || message.type === 'CONTENT_SCRIPT_READY')) {
+    // CONTENT_SCRIPT_READY 仅记录日志，不需要响应
+    if (message.type === 'CONTENT_SCRIPT_READY') {
+      console.log('[Background] 📋 Content Script 状态报告:', JSON.stringify(message.payload, null, 2));
+    }
+    return false; // 不处理，让其他监听器或直接忽略
+  }
+
   handleMessage(message, sender).then(sendResponse).catch((err: Error) => {
     sendResponse({ success: false, error: err.message });
   });
@@ -108,6 +117,16 @@ async function handleMessage(
       return { success: true };
     }
 
+    case 'TEST_ALIYUN_API': {
+      const { service, accessKeyId, accessKeySecret, appKey } = (payload || {}) as any;
+      try {
+        const result = await testAliyunApi(service, accessKeyId, accessKeySecret, appKey);
+        return result;
+      } catch (err: any) {
+        return { success: false, error: err.message };
+      }
+    }
+
     case 'STATUS_UPDATE': {
       return {
         isRunning,
@@ -175,7 +194,9 @@ async function startTranslation(tabId: number, streamId: string): Promise<void> 
   };
 
   console.log('[Background] 配置加载完成:', {
-    xfyunAppId: appSettings.xfyun.appId ? '已配置' : '未配置',
+    xfyunAppId: appSettings.xfyun.appId || '(空)',
+    xfyunApiKey: appSettings.xfyun.apiKey ? appSettings.xfyun.apiKey.substring(0, 8) + '...' : '(空)',
+    xfyunApiSecret: appSettings.xfyun.apiSecret ? '已配置(长度:' + appSettings.xfyun.apiSecret.length + ')' : '(空)',
     aliyunKeyId: appSettings.aliyun.accessKeyId ? '已配置' : '未配置',
   });
 
@@ -288,6 +309,106 @@ async function stopTranslation(): Promise<void> {
 
   currentTabId = null;
   console.log('[Background] 翻译已停止');
+}
+
+/**
+ * 代理阿里云 API 测试（选项页面不能直接 fetch 外部 URL，由 background 代理）
+ */
+async function testAliyunApi(
+  service: 'translation' | 'tts',
+  accessKeyId: string,
+  accessKeySecret: string,
+  appKey?: string
+): Promise<{ success: boolean; data?: string; error?: string }> {
+  const timestamp = new Date().toISOString().replace(/\.\d{3}/, '');
+  const nonce = Math.random().toString(36).substring(2);
+
+  let params: Record<string, string>;
+  let endpoint: string;
+
+  if (service === 'translation') {
+    endpoint = 'https://mt.cn-hangzhou.aliyuncs.com/';
+    params = {
+      Action: 'TranslateGeneral',
+      Version: '2018-10-12',
+      Format: 'JSON',
+      FormatType: 'text',
+      AccessKeyId: accessKeyId,
+      SignatureMethod: 'HMAC-SHA1',
+      SignatureVersion: '1.0',
+      SignatureNonce: nonce,
+      Timestamp: timestamp,
+      SourceLanguage: 'en',
+      TargetLanguage: 'zh',
+      SourceText: 'hello',
+      Scene: 'general',
+    };
+  } else {
+    // TTS 测试：获取 Token 即可验证连通性
+    if (!appKey) {
+      return { success: false, error: '请先在选项页面填写语音合成 AppKey（在 nls.console.aliyun.com 创建项目获取）' };
+    }
+    endpoint = 'https://nls-meta.cn-shanghai.aliyuncs.com/';
+    params = {
+      AccessKeyId: accessKeyId,
+      Action: 'CreateToken',
+      Version: '2019-02-28',
+      Format: 'JSON',
+      SignatureMethod: 'HMAC-SHA1',
+      SignatureVersion: '1.0',
+      SignatureNonce: nonce,
+      Timestamp: timestamp,
+    };
+  }
+
+  // HMAC-SHA1 签名 (GET)
+  const sortedKeys = Object.keys(params).sort();
+  const canonicalized = sortedKeys
+    .map(k => encodeURIComponent(k).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase()) + '=' +
+                encodeURIComponent(params[k]).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase()))
+    .join('&');
+  const stringToSign = `GET&${encodeURIComponent('/')}&${encodeURIComponent(canonicalized)}`;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', encoder.encode(accessKeySecret + '&'),
+    { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(stringToSign));
+  const signature = btoa(String.fromCharCode(...new Uint8Array(sig)));
+
+  params.Signature = signature;
+  const queryString = Object.keys(params)
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`)
+    .join('&');
+  const url = `${endpoint}?${queryString}`;
+
+  console.log('[Background] 测试阿里云 API:', service, 'URL:', url.substring(0, 200));
+
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (fetchErr: any) {
+    console.error('[Background] fetch 失败:', fetchErr.message, 'URL:', url);
+    return { success: false, error: `网络请求失败: ${fetchErr.message}` };
+  }
+
+  let data: any;
+  try {
+    data = await response.json();
+  } catch (jsonErr: any) {
+    const text = await response.text().catch(() => '');
+    console.error('[Background] JSON 解析失败, 原始响应:', text.substring(0, 200));
+    return { success: false, error: `响应解析失败 (HTTP ${response.status}): ${text.substring(0, 100)}` };
+  }
+
+  if (data.Code === '200') {
+    if (service === 'translation') {
+      return { success: true, data: data.Data?.Translated || 'hello' };
+    } else {
+      return { success: true, data: `Token 获取成功, 有效期至 ${data.Data?.ExpireTime || '?'}` };
+    }
+  } else {
+    return { success: false, error: `${data.Code}: ${data.Message || '未知错误'}` };
+  }
 }
 
 console.log('[Background] Service Worker 已启动');

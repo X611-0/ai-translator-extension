@@ -12,7 +12,10 @@
   ],
   "host_permissions": [
     "https://*/*",
-    "wss://*.xfyun.cn/*"
+    "wss://*/*",
+    "https://mt.cn-hangzhou.aliyuncs.com/*",
+    "https://nls-meta.cn-shanghai.aliyuncs.com/*",
+    "wss://nls-gateway.aliyuncs.com/*"
   ],
   "background": {
     "service_worker": "src/background/index.ts",

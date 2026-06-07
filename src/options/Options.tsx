@@ -1,12 +1,17 @@
 import React, { useState, useEffect } from 'react';
-import { AppSettings, DisplaySettings, LanguageSettings } from '@/types';
+import { AppSettings, DisplaySettings, LanguageSettings, XFYunConfig, AliyunConfig } from '@/types';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings } from '@/config';
+
+type TabKey = 'api' | 'display' | 'language';
 
 const Options: React.FC = () => {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'display' | 'language'>('display');
+  const [activeTab, setActiveTab] = useState<TabKey>('api');
+  const [showSecrets, setShowSecrets] = useState(false);
+  const [testStatus, setTestStatus] = useState<{ xfyun?: string; aliyun?: string; tts?: string }>({});
+  const [testing, setTesting] = useState(false);
 
   useEffect(() => {
     loadSettings().then((s) => {
@@ -15,14 +20,112 @@ const Options: React.FC = () => {
     });
   }, []);
 
+  // 测试阿里云翻译连接（先保存再通过 background 代理）
+  const handleTestAliyun = async () => {
+    setTesting(true);
+    setTestStatus(prev => ({ ...prev, aliyun: '保存并测试中...' }));
+
+    try {
+      // 先保存配置
+      await saveSettings(settings);
+
+      const { accessKeyId, accessKeySecret } = settings.aliyun;
+      if (!accessKeyId || !accessKeySecret) {
+        setTestStatus(prev => ({ ...prev, aliyun: '❌ 请先填写 AccessKey' }));
+        setTesting(false);
+        return;
+      }
+
+      const response = await chrome.runtime.sendMessage({
+        type: 'TEST_ALIYUN_API',
+        payload: { service: 'translation', accessKeyId, accessKeySecret },
+      });
+
+      if (response?.success) {
+        setTestStatus(prev => ({ ...prev, aliyun: `✅ 翻译连接成功! "hello" → "${response.data}"` }));
+      } else {
+        setTestStatus(prev => ({ ...prev, aliyun: `❌ ${response?.error || '未知错误'}` }));
+      }
+    } catch (err: any) {
+      setTestStatus(prev => ({ ...prev, aliyun: `❌ 请求失败: ${err.message}。请确认已 Reload 扩展` }));
+    }
+    setTesting(false);
+  };
+
+  // 测试阿里云 TTS 连接（先保存再通过 background 代理）
+  const handleTestTTS = async () => {
+    setTesting(true);
+    setTestStatus(prev => ({ ...prev, tts: '保存并测试中...' }));
+
+    try {
+      // 先保存配置
+      await saveSettings(settings);
+
+      const { accessKeyId, accessKeySecret, ttsAppKey } = settings.aliyun;
+      if (!accessKeyId || !accessKeySecret) {
+        setTestStatus(prev => ({ ...prev, tts: '❌ 请先填写 AccessKey' }));
+        setTesting(false);
+        return;
+      }
+      if (!ttsAppKey) {
+        setTestStatus(prev => ({ ...prev, tts: '❌ 请先填写语音合成 AppKey（在 nls.console.aliyun.com 创建项目）' }));
+        setTesting(false);
+        return;
+      }
+
+      const response = await chrome.runtime.sendMessage({
+        type: 'TEST_ALIYUN_API',
+        payload: { service: 'tts', accessKeyId, accessKeySecret, appKey: ttsAppKey },
+      });
+
+      if (response?.success) {
+        setTestStatus(prev => ({ ...prev, tts: `✅ TTS 连接成功! 任务ID: ${response.data}` }));
+      } else {
+        setTestStatus(prev => ({ ...prev, tts: `❌ ${response?.error || '未知错误'}` }));
+      }
+    } catch (err: any) {
+      setTestStatus(prev => ({ ...prev, tts: `❌ 请求失败: ${err.message}。请确认已 Reload 扩展` }));
+    }
+    setTesting(false);
+  };
+
+  // 测试讯飞配置（验证格式）
+  const handleTestXFYun = () => {
+    setTestStatus(prev => ({ ...prev, xfyun: '' }));
+    const { appId, apiKey, apiSecret } = settings.xfyun;
+    if (!appId || !apiKey || !apiSecret) {
+      setTestStatus(prev => ({ ...prev, xfyun: '❌ 请填写完整的讯飞配置' }));
+      return;
+    }
+    if (!/^[a-f0-9]{8}$/i.test(appId.trim())) {
+      setTestStatus(prev => ({ ...prev, xfyun: '❌ App ID 格式不正确 (应为8位十六进制)' }));
+      return;
+    }
+    setTestStatus(prev => ({ ...prev, xfyun: '✅ 配置格式正确 (实际连接需启动翻译时验证)' }));
+  };
+
   const handleSave = async () => {
     try {
       await saveSettings(settings);
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      setTimeout(() => setSaved(false), 3000);
     } catch (err) {
       console.error('保存失败:', err);
     }
+  };
+
+  const updateXFYun = (field: keyof XFYunConfig, value: string) => {
+    setSettings((prev) => ({
+      ...prev,
+      xfyun: { ...prev.xfyun, [field]: value },
+    }));
+  };
+
+  const updateAliyun = (field: keyof AliyunConfig, value: string) => {
+    setSettings((prev) => ({
+      ...prev,
+      aliyun: { ...prev.aliyun, [field]: value },
+    }));
   };
 
   const updateDisplay = (field: keyof DisplaySettings, value: any) => {
@@ -53,25 +156,26 @@ const Options: React.FC = () => {
         {/* 标题 */}
         <div className="border-b border-gray-700 pb-4">
           <h1 className="text-2xl font-bold">AI同声传译助手 - 设置</h1>
-          <p className="text-gray-400 text-sm mt-1">配置显示偏好和语言设置</p>
+          <p className="text-gray-400 text-sm mt-1">配置 API 密钥、显示偏好和语言</p>
         </div>
 
         {/* 标签页导航 */}
         <div className="flex space-x-2 bg-gray-800 rounded-lg p-1">
           {[
+            { key: 'api', label: 'API 密钥', icon: '🔑' },
             { key: 'display', label: '显示设置', icon: '🎨' },
             { key: 'language', label: '语言设置', icon: '🌐' },
           ].map((tab) => (
             <button
               key={tab.key}
-              onClick={() => setActiveTab(tab.key as any)}
+              onClick={() => setActiveTab(tab.key as TabKey)}
               className={`flex-1 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
                 activeTab === tab.key
                   ? 'bg-indigo-600 text-white'
                   : 'text-gray-400 hover:text-white hover:bg-gray-700'
               }`}
             >
-              <span className="mr-2">{tab.icon}</span>
+              <span className="mr-1">{tab.icon}</span>
               {tab.label}
             </button>
           ))}
@@ -79,12 +183,172 @@ const Options: React.FC = () => {
 
         {/* 保存成功提示 */}
         {saved && (
-          <div className="bg-green-900/50 border border-green-700 rounded-lg p-4 text-green-200">
-            保存成功！
+          <div className="bg-green-900/50 border border-green-700 rounded-lg p-4 text-green-200 text-sm">
+            ✅ 设置已保存！刷新页面后生效。
           </div>
         )}
 
-        {/* 显示设置 */}
+        {/* ========== API 密钥设置 ========== */}
+        {activeTab === 'api' && (
+          <section className="space-y-4">
+            {/* 讯飞设置 */}
+            <div className="bg-gray-800 rounded-xl p-5 space-y-4">
+              <h2 className="font-semibold flex items-center space-x-2">
+                <span>🎤</span>
+                <span>讯飞语音识别 (AST)</span>
+              </h2>
+              <p className="text-xs text-gray-500">
+                前往 <a href="https://console.xfyun.cn/" target="_blank" className="text-indigo-400 underline">讯飞开放平台控制台</a> 获取，
+                需开通「实时语音转写」服务
+              </p>
+
+              <div className="grid gap-3">
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">App ID</label>
+                  <input
+                    type="text"
+                    value={settings.xfyun.appId}
+                    onChange={(e) => updateXFYun('appId', e.target.value)}
+                    placeholder="例如: 65692fc6"
+                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">API Key (accessKeyId)</label>
+                  <input
+                    type={showSecrets ? 'text' : 'password'}
+                    value={settings.xfyun.apiKey}
+                    onChange={(e) => updateXFYun('apiKey', e.target.value)}
+                    placeholder="32位十六进制字符串"
+                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">API Secret (用于签名)</label>
+                  <input
+                    type={showSecrets ? 'text' : 'password'}
+                    value={settings.xfyun.apiSecret}
+                    onChange={(e) => updateXFYun('apiSecret', e.target.value)}
+                    placeholder="32位字符串"
+                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center space-x-3">
+                <button
+                  onClick={() => setShowSecrets(!showSecrets)}
+                  className="text-xs text-gray-500 hover:text-gray-300"
+                >
+                  {showSecrets ? '🙈 隐藏密钥' : '👁 显示密钥'}
+                </button>
+                <button
+                  onClick={handleTestXFYun}
+                  className="text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-600 rounded px-2 py-0.5"
+                >
+                  🔍 验证配置
+                </button>
+              </div>
+              {testStatus.xfyun && (
+                <div className={`text-xs rounded p-2 ${
+                  testStatus.xfyun.startsWith('✅') ? 'bg-green-900/50 text-green-300' : 'bg-red-900/50 text-red-300'
+                }`}>
+                  {testStatus.xfyun}
+                </div>
+              )}
+            </div>
+
+            {/* 阿里云设置 */}
+            <div className="bg-gray-800 rounded-xl p-5 space-y-4">
+              <h2 className="font-semibold flex items-center space-x-2">
+                <span>🌍</span>
+                <span>阿里云翻译</span>
+              </h2>
+              <p className="text-xs text-gray-500">
+                前往 <a href="https://ram.console.aliyun.com/manage/ak" target="_blank" className="text-indigo-400 underline">阿里云 RAM 访问控制</a> 获取 AccessKey
+              </p>
+
+              <div className="grid gap-3">
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">AccessKey ID</label>
+                  <input
+                    type={showSecrets ? 'text' : 'password'}
+                    value={settings.aliyun.accessKeyId}
+                    onChange={(e) => updateAliyun('accessKeyId', e.target.value)}
+                    placeholder="例如: LTAI5t..."
+                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">AccessKey Secret</label>
+                  <input
+                    type={showSecrets ? 'text' : 'password'}
+                    value={settings.aliyun.accessKeySecret}
+                    onChange={(e) => updateAliyun('accessKeySecret', e.target.value)}
+                    placeholder="例如: ***"
+                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm font-mono"
+                  />
+                </div>
+              </div>
+
+              {/* TTS AppKey */}
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">
+                  语音合成 AppKey <span className="text-gray-600">(可选，需朗读功能时填写)</span>
+                </label>
+                <input
+                  type={showSecrets ? 'text' : 'password'}
+                  value={settings.aliyun.ttsAppKey || ''}
+                  onChange={(e) => updateAliyun('ttsAppKey', e.target.value)}
+                  placeholder="在 nls.console.aliyun.com 创建项目获取"
+                  className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm font-mono"
+                />
+                <p className="text-xs text-gray-600 mt-1">
+                  前往 <a href="https://nls.console.aliyun.com/" target="_blank" className="text-indigo-400 underline">智能语音交互控制台</a> 创建项目获取 AppKey
+                </p>
+              </div>
+
+              <div className="flex items-center space-x-3">
+                <button
+                  onClick={() => setShowSecrets(!showSecrets)}
+                  className="text-xs text-gray-500 hover:text-gray-300"
+                >
+                  {showSecrets ? '🙈 隐藏密钥' : '👁 显示密钥'}
+                </button>
+                <button
+                  onClick={handleTestAliyun}
+                  disabled={testing}
+                  className="text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-600 rounded px-2 py-0.5 disabled:opacity-50"
+                >
+                  {testing ? '⏳' : '🔍'} 测试翻译
+                </button>
+                <button
+                  onClick={handleTestTTS}
+                  disabled={testing}
+                  className="text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-600 rounded px-2 py-0.5 disabled:opacity-50"
+                >
+                  🔍 测试语音
+                </button>
+              </div>
+              {testStatus.aliyun && (
+                <div className={`text-xs rounded p-2 ${
+                  testStatus.aliyun.startsWith('✅') ? 'bg-green-900/50 text-green-300' : 'bg-red-900/50 text-red-300'
+                }`}>
+                  {testStatus.aliyun}
+                </div>
+              )}
+              {testStatus.tts && (
+                <div className={`text-xs rounded p-2 ${
+                  testStatus.tts.startsWith('✅') ? 'bg-green-900/50 text-green-300' : 'bg-red-900/50 text-red-300'
+                }`}>
+                  {testStatus.tts}
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* ========== 显示设置 ========== */}
         {activeTab === 'display' && (
           <section className="bg-gray-800 rounded-xl p-5 space-y-4">
             <h2 className="font-semibold flex items-center space-x-2">
@@ -93,7 +357,6 @@ const Options: React.FC = () => {
             </h2>
 
             <div className="grid gap-4">
-              {/* 字幕位置 */}
               <div>
                 <label className="block text-sm text-gray-400 mb-2">字幕位置</label>
                 <div className="flex space-x-2">
@@ -117,7 +380,6 @@ const Options: React.FC = () => {
                 </div>
               </div>
 
-              {/* 字体大小 */}
               <div>
                 <label className="block text-sm text-gray-400 mb-1">
                   字体大小: {settings.display.subtitleFontSize}px
@@ -132,7 +394,6 @@ const Options: React.FC = () => {
                 />
               </div>
 
-              {/* 背景透明度 */}
               <div>
                 <label className="block text-sm text-gray-400 mb-1">
                   背景透明度: {Math.round(settings.display.subtitleBackgroundOpacity * 100)}%
@@ -147,7 +408,6 @@ const Options: React.FC = () => {
                 />
               </div>
 
-              {/* 字幕颜色 */}
               <div>
                 <label className="block text-sm text-gray-400 mb-1">字幕颜色</label>
                 <div className="flex space-x-2">
@@ -166,7 +426,6 @@ const Options: React.FC = () => {
                 </div>
               </div>
 
-              {/* 最大行数 */}
               <div>
                 <label className="block text-sm text-gray-400 mb-1">历史字幕行数</label>
                 <select
@@ -180,7 +439,6 @@ const Options: React.FC = () => {
                 </select>
               </div>
 
-              {/* 双语模式 */}
               <div className="flex items-center justify-between">
                 <label className="text-sm text-gray-400">显示原文（双语模式）</label>
                 <button
@@ -200,7 +458,7 @@ const Options: React.FC = () => {
           </section>
         )}
 
-        {/* 语言设置 */}
+        {/* ========== 语言设置 ========== */}
         {activeTab === 'language' && (
           <section className="bg-gray-800 rounded-xl p-5 space-y-4">
             <h2 className="font-semibold flex items-center space-x-2">
@@ -209,7 +467,6 @@ const Options: React.FC = () => {
             </h2>
 
             <div className="grid gap-4">
-              {/* 源语言 */}
               <div>
                 <label className="block text-sm text-gray-400 mb-1">源语言（识别语言）</label>
                 <select
@@ -236,7 +493,6 @@ const Options: React.FC = () => {
                 </select>
               </div>
 
-              {/* 目标语言 */}
               <div>
                 <label className="block text-sm text-gray-400 mb-1">目标语言（翻译语言）</label>
                 <select
@@ -266,7 +522,7 @@ const Options: React.FC = () => {
           </section>
         )}
 
-        {/* 保存按钮 */}
+        {/* 保存 / 重置按钮 */}
         <div className="flex space-x-4">
           <button
             onClick={handleSave}
@@ -276,18 +532,15 @@ const Options: React.FC = () => {
           </button>
 
           <button
-            onClick={() => setSettings(DEFAULT_SETTINGS)}
+            onClick={() => { setSettings(DEFAULT_SETTINGS); }}
             className="px-6 bg-gray-700 hover:bg-gray-600 text-gray-300 font-medium py-2.5 rounded-lg transition-colors"
           >
             重置
           </button>
         </div>
 
-        {/* 页脚 */}
         <div className="border-t border-gray-700 pt-4 text-center">
-          <p className="text-xs text-gray-500">
-            AI同声传译助手 v1.0.0 | API已内置，可直接使用
-          </p>
+          <p className="text-xs text-gray-500">AI同声传译助手 v1.0.0</p>
         </div>
       </div>
     </div>

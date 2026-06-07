@@ -1,63 +1,42 @@
 /**
- * 讯飞语音识别服务
- * 基于WebSocket的实时流式语音识别
- * 支持中间结果、最终结果、延迟统计、错误处理
+ * 讯飞实时语音转写服务（AST API v1）
+ * 文档: https://www.xfyun.cn/doc/asr/rtasr/API.html
+ *
+ * WebSocket 直连，握手后发送 PCM16 二进制音频，接收 JSON 转写结果
  */
 
-import { XFYunConfig, XFYunResponse, RecognitionResult } from '@/types';
-import { arrayBufferToBase64, buildWebSocketUrl } from './websocket';
+import { XFYunConfig, RecognitionResult } from '@/types';
 
 export type RecognitionCallback = (result: RecognitionResult) => void;
-
-export enum RecognitionError {
-  NOT_CONNECTED = 'NOT_CONNECTED',
-  CONNECTION_FAILED = 'CONNECTION_FAILED',
-  AUTH_FAILED = 'AUTH_FAILED',
-  QUOTA_EXCEEDED = 'QUOTA_EXCEEDED',
-  SERVER_ERROR = 'SERVER_ERROR',
-  TIMEOUT = 'TIMEOUT',
-  INVALID_CONFIG = 'INVALID_CONFIG',
-  UNKNOWN = 'UNKNOWN',
-}
 
 export interface RecognitionEvents {
   onConnect?: () => void;
   onDisconnect?: () => void;
-  onError?: (error: RecognitionError, message: string) => void;
+  onError?: (error: string, message: string) => void;
   onResult?: RecognitionCallback;
-  onPartialResult?: RecognitionCallback;     // 中间结果
-  onFinalResult?: RecognitionCallback;       // 最终结果
+  onPartialResult?: RecognitionCallback;
+  onFinalResult?: RecognitionCallback;
 }
 
 export interface RecognitionStats {
-  totalFrames: number;        // 发送的总帧数
-  totalBytes: number;          // 发送的总字节数
-  totalResults: number;        // 收到结果数
-  averageLatency: number;      // 平均延迟
-  lastLatency: number;         // 最近延迟
-  errorCount: number;          // 错误数
-  startTime: number | null;    // 会话开始时间
+  totalFrames: number;
+  totalBytes: number;
+  totalResults: number;
+  averageLatency: number;
+  lastLatency: number;
+  errorCount: number;
+  startTime: number | null;
 }
 
 export class XFYunRecognition {
-  private config: XFYunConfig;
+  private config: XFYunConfig & { language?: string };
   private ws: WebSocket | null = null;
   private callback: RecognitionCallback | null = null;
   private events: RecognitionEvents = {};
   private segmentId = 0;
   private isConnected = false;
-  private isClosing = false;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private audioQueue: ArrayBuffer[] = [];
-  private sessionStartTime = 0;
-  private readonly WS_URL = 'wss://iat-api.xfyun.cn/v2/iat';
-  private readonly RECONNECT_DELAY = 3000;
-  private readonly HEARTBEAT_INTERVAL = 30000;
-  private readonly CONNECT_TIMEOUT = 15000; // 增加到15秒
-
+  private connecting = false;
+  private sessionId: string = '';
   private stats: RecognitionStats = {
     totalFrames: 0,
     totalBytes: 0,
@@ -68,571 +47,433 @@ export class XFYunRecognition {
     startTime: null,
   };
 
-  // 跟踪当前句子的中间结果
-  private currentSegment: {
-    sn: number;
-    text: string;
-    lastUpdate: number;
-    audioStartTime: number;
-  } | null = null;
+  private readonly WS_URL = 'wss://office-api-ast-dx.iflyaisol.com/ast/communicate/v1';
 
-  constructor(config: XFYunConfig) {
+  constructor(config: XFYunConfig & { language?: string }) {
     this.config = config;
+    console.log('[XFYun AST] 初始化, appId:', config.appId, 'language:', config.language);
   }
 
   /**
-   * 验证配置
+   * 生成 UUID v4
    */
-  static validateConfig(config: XFYunConfig): { valid: boolean; errors: string[] } {
-    const errors: string[] = [];
-    if (!config.appId?.trim()) errors.push('AppID 不能为空');
-    if (!config.apiKey?.trim()) errors.push('APIKey 不能为空');
-    if (!config.apiSecret?.trim()) errors.push('APISecret 不能为空');
-    if (config.appId && !/^[a-f0-9]{8,}$/i.test(config.appId.trim())) {
-      errors.push('AppID 格式不正确');
-    }
-    return { valid: errors.length === 0, errors };
+  private generateUUID(): string {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  /**
+   * 生成 UTC+8 格式的时间字符串
+   * 文档格式: 2025-09-04T15:38:07+0800
+   */
+  private formatUtcTime(): string {
+    const now = new Date();
+    // 转为 UTC+8 (北京时间)
+    const utc8 = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+    const iso = utc8.toISOString();
+    // toISOString 输出: 2025-06-07T10:30:00.000Z
+    // 去掉毫秒和 Z，加上 +0800
+    return iso.replace(/\.\d{3}Z$/, '') + '+0800';
+  }
+
+  /**
+   * 生成 HMAC-SHA1 签名
+   * 文档: 参数升序排序 → URL编码 → &拼接 → HmacSHA1 → Base64
+   */
+  private async generateSignature(params: Record<string, string>): Promise<string> {
+    // 1. 按参数名升序排序
+    const sortedKeys = Object.keys(params).sort();
+
+    // 2. 对每个参数的键和值分别进行 URL 编码，按 "键=值&" 拼接
+    const baseString = sortedKeys
+      .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
+      .join('&');
+
+    console.log('[XFYun AST] 签名 baseString:', baseString);
+
+    // 3. 以 accessKeySecret 为密钥，对 baseString 进行 HmacSHA1 加密
+    const encoder = new TextEncoder();
+    const keyData = encoder.encode(this.config.apiSecret);
+    const messageData = encoder.encode(baseString);
+
+    const key = await crypto.subtle.importKey(
+      'raw',
+      keyData,
+      { name: 'HMAC', hash: 'SHA-1' },
+      false,
+      ['sign']
+    );
+
+    const signatureBuffer = await crypto.subtle.sign('HMAC', key, messageData);
+
+    // 4. Base64 编码
+    const signatureBase64 = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
+    console.log('[XFYun AST] signature:', signatureBase64.substring(0, 20) + '...');
+
+    return signatureBase64;
+  }
+
+  /**
+   * 构建 WebSocket URL（带鉴权参数）
+   */
+  private async buildWebSocketUrl(): Promise<string> {
+    const uuid = this.generateUUID();
+    const utc = this.formatUtcTime();
+
+    const params: Record<string, string> = {
+      appId: this.config.appId,
+      accessKeyId: this.config.apiKey,
+      uuid: uuid,
+      utc: utc,
+      lang: this.config.language || 'autodialect',
+      audio_encode: 'pcm_s16le',
+      samplerate: '16000',
+    };
+
+    const signature = await this.generateSignature(params);
+
+    // 所有参数（包括 signature）按 key 排序后 URL 编码
+    // 打印参数（隐藏敏感信息）
+    console.log('[XFYun AST] 请求参数:', {
+      appId: params.appId,
+      accessKeyId: params.accessKeyId.substring(0, 8) + '...',
+      utc: params.utc,
+      lang: params.lang,
+      audio_encode: params.audio_encode,
+      samplerate: params.samplerate,
+      uuid: params.uuid,
+      signature: signature.substring(0, 10) + '...',
+    });
+
+    const allParams: Record<string, string> = { ...params, signature };
+    const sortedKeys = Object.keys(allParams).sort();
+    const queryString = sortedKeys
+      .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(allParams[key])}`)
+      .join('&');
+
+    const url = `${this.WS_URL}?${queryString}`;
+    console.log('[XFYun AST] 完整 URL (前150字符):', url.substring(0, 150) + '...');
+
+    return url;
   }
 
   /**
    * 连接服务器
    */
   async connect(): Promise<void> {
-    console.log('[XFYun] 开始连接..., 当前状态: ws=', !!this.ws, 'isConnected=', this.isConnected, 'readyState=', this.ws ? this.ws.readyState : 'N/A');
-
-    if (this.ws && (this.isConnected || this.ws.readyState === WebSocket.CONNECTING)) {
-      console.log('[XFYun] WebSocket已在连接中');
+    if (this.connecting) {
+      console.log('[XFYun AST] 正在连接中，等待...');
       return;
     }
+    this.connecting = true;
 
-    // 清理旧连接
-    if (this.ws) {
-      console.log('[XFYun] 清理旧的WebSocket连接');
-      try {
-        this.ws.close();
-      } catch (e) {
-        console.warn('[XFYun] 关闭旧连接失败:', e);
+    try {
+      if (this.ws) {
+        try { this.ws.close(); } catch {}
+        this.ws = null;
       }
-      this.ws = null;
-    }
+      this.isConnected = false;
 
-    // 验证配置
-    const validation = XFYunRecognition.validateConfig(this.config);
-    if (!validation.valid) {
-      const err = new Error(validation.errors.join(', '));
-      console.error('[XFYun] 配置验证失败:', validation.errors);
-      this.events.onError?.(RecognitionError.INVALID_CONFIG, err.message);
-      throw err;
-    }
+      console.log('[XFYun AST] 构建连接 URL...');
+      const url = await this.buildWebSocketUrl();
 
-    console.log('[XFYun] 配置验证通过, appId:', this.config.appId);
+      this.ws = new WebSocket(url);
+      this.ws.binaryType = 'arraybuffer';
 
-    return new Promise(async (resolve, reject) => {
-      try {
-        console.log('[XFYun] 构建WebSocket URL...');
-        const url = await buildWebSocketUrl(
-          this.config.appId,
-          this.config.apiKey,
-          this.config.apiSecret
-        );
+      await new Promise<void>((resolve, reject) => {
+        if (!this.ws) {
+          this.connecting = false;
+          reject(new Error('WebSocket 创建失败'));
+          return;
+        }
 
-        console.log('[XFYun] WebSocket URL:', url.substring(0, 100) + '...');
-
-        this.ws = new WebSocket(url);
-        this.ws.binaryType = 'arraybuffer';
-
-        console.log('[XFYun] WebSocket 创建完成, readyState:', this.ws.readyState);
+        const timeout = setTimeout(() => {
+          reject(new Error('WebSocket 连接超时 (10秒)'));
+        }, 10000);
 
         this.ws.onopen = () => {
-          console.log('[XFYun] WebSocket已连接, readyState:', this.ws?.readyState);
+          clearTimeout(timeout);
+          console.log('[XFYun AST] WebSocket 已连接，等待握手响应...');
           this.isConnected = true;
-          this.isClosing = false;
-          this.reconnectAttempts = 0;
-          this.segmentId = 0;
-          this.sessionStartTime = Date.now();
-          this.stats.startTime = this.sessionStartTime;
-          this.startHeartbeat();
+          this.stats.startTime = Date.now();
           this.events.onConnect?.();
-
-          // 立即发送第一帧（first=true, status=0, 包含音频参数）
-          this.sendFirstFrame();
-
-          this.flushAudioQueue();
           resolve();
         };
 
-        this.ws.onmessage = (event: MessageEvent) => {
-          console.log('[XFYun] 收到消息, type:', typeof event.data, 'data:', typeof event.data === 'string' ? event.data.substring(0, 200) : event.data);
-          this.handleMessage(event.data);
-        };
-
-        this.ws.onerror = (event: Event) => {
-          console.error('[XFYun] WebSocket错误:', event, 'readyState:', this.ws?.readyState);
-          this.stats.errorCount++;
-          this.events.onError?.(RecognitionError.CONNECTION_FAILED, 'WebSocket连接失败');
-        };
-
-        this.ws.onclose = (event: CloseEvent) => {
-          console.log('[XFYun] WebSocket关闭, code:', event.code, 'reason:', event.reason, 'wasClean:', event.wasClean);
+        this.ws.onerror = () => {
+          clearTimeout(timeout);
+          console.error('[XFYun AST] WebSocket 连接失败');
+          console.error('[XFYun AST] 可能原因: 1) appId/apiKey/apiSecret 错误 2) 签名算法不正确 3) 网络不通');
           this.isConnected = false;
-          this.stopHeartbeat();
+          this.ws = null;
+          this.stats.errorCount++;
+          reject(new Error('WebSocket 连接失败，请检查 API 配置'));
+        };
+
+        this.ws.onclose = (event) => {
+          console.log('[XFYun AST] WebSocket 关闭, code:', event.code, 'reason:', event.reason);
+          // 如果是认证失败 (通常 code 4001/4002)
+          if (event.code === 4001 || event.code === 4002) {
+            console.error('[XFYun AST] 认证失败! 请检查 appId/apiKey/apiSecret');
+          }
+          this.isConnected = false;
+          this.ws = null;
           this.events.onDisconnect?.();
-
-          // 认证失败不重连
-          if (event.code === 40001 || event.code === 40002) {
-            this.events.onError?.(RecognitionError.AUTH_FAILED, '认证失败，请检查API密钥');
-            return;
-          }
-
-          // 正常关闭不重连
-          if (this.isClosing) {
-            return;
-          }
-
-          // 自动重连
-          this.scheduleReconnect();
         };
 
-        // 连接超时
-        setTimeout(() => {
-          if (!this.isConnected) {
-            console.error('[XFYun] 连接超时');
-            this.ws?.close();
-            this.ws = null;
-            this.stats.errorCount++;
-            this.events.onError?.(RecognitionError.TIMEOUT, '连接超时');
-            reject(new Error('连接超时'));
+        this.ws.onmessage = (event) => {
+          if (typeof event.data === 'string') {
+            this.handleMessage(event.data);
+          } else if (event.data instanceof ArrayBuffer) {
+            // 忽略二进制回显
           }
-        }, this.CONNECT_TIMEOUT);
-      } catch (err) {
-        console.error('[XFYun] 连接异常:', err);
-        this.stats.errorCount++;
-        reject(err);
-      }
-    });
-  }
-
-  /**
-   * 发送音频数据
-   */
-  async sendAudio(audioData: ArrayBuffer): Promise<void> {
-    console.log('[XFYun] sendAudio 调用, byteLength:', audioData.byteLength, 'ws状态:', {
-      hasWs: !!this.ws,
-      isConnected: this.isConnected,
-      readyState: this.ws ? this.ws.readyState : 'N/A',
-      queueLength: this.audioQueue.length,
-    });
-
-    // 如果 WebSocket 未初始化，先连接
-    if (!this.ws) {
-      console.log('[XFYun] WebSocket未初始化，开始连接...');
-      try {
-        await this.connect();
-      } catch (err) {
-        console.error('[XFYun] 连接失败:', err);
-        return;
-      }
-      // 连接后再次检查
-      if (!this.ws) {
-        console.error('[XFYun] 连接后 ws 仍为空');
-        return;
-      }
-    }
-
-    this.stats.totalFrames++;
-    this.stats.totalBytes += audioData.byteLength;
-
-    if (!this.isConnected || !this.ws) {
-      console.warn('[XFYun] 未连接，将音频放入队列 (isConnected:', this.isConnected, ', ws:', !!this.ws, ')');
-      this.audioQueue.push(audioData);
-      return;
-    }
-
-    const ws = this.ws; // 保存引用，避免 TypeScript 类型问题
-    if (ws.readyState !== WebSocket.OPEN) {
-      console.warn('[XFYun] WebSocket未就绪，当前状态:', ws.readyState, '将音频放入队列');
-      this.audioQueue.push(audioData);
-      return;
-    }
-
-    const base64 = arrayBufferToBase64(audioData);
-    // 中间帧：status=1
-    const frame = {
-      data: {
-        status: 1,
-        format: 'audio/L16;rate=16000',
-        audio: base64,
-        encoding: 'raw',
-      },
-    };
-
-    try {
-      ws.send(JSON.stringify(frame));
-      console.log('[XFYun] 已发送音频帧, byteLength:', audioData.byteLength);
-    } catch (err) {
-      console.error('[XFYun] 发送音频失败:', err);
-      this.audioQueue.push(audioData);
-    }
-  }
-
-  /**
-   * 发送第一帧
-   */
-  private sendFirstFrame(): void {
-    console.log('[XFYun] sendFirstFrame 调用, ws:', !!this.ws);
-    if (!this.ws) {
-      console.error('[XFYun] sendFirstFrame: ws 为空');
-      return;
-    }
-
-    // 讯飞 IAT v2 第一帧格式：
-    // - common: 包含 app_id
-    // - business: 包含业务参数
-    // - data: 包含音频参数（status=0 表示第一帧）
-    // 语言设置：默认英文，可通过配置切换
-    const language = this.config.language || 'en_us';
-    console.log('[XFYun] 识别语言:', language);
-
-    const firstFrame = {
-      common: {
-        app_id: this.config.appId,
-      },
-      business: {
-        domain: 'iat',
-        language: language, // en_us=英文, zh_cn=中文
-        accent: language === 'en_us' ? '' : 'mandarin',
-        vad_eos: 3000, // 静音检测超时时间（ms），3秒静音后发送最终结果
-        dwa: 'wpgs', // 动态修正
-        ptt: 0, // 0=不添加标点, 1=添加标点（必须是整数）
-      },
-      data: {
-        status: 0,
-        format: 'audio/L16;rate=16000',
-        audio: '',
-        encoding: 'raw',
-      },
-    };
-
-    const frameStr = JSON.stringify(firstFrame);
-    console.log('[XFYun] 第一帧内容:', frameStr.substring(0, 200));
-
-    try {
-      this.ws.send(frameStr);
-      console.log('[XFYun] 已发送第一帧（status=0, app_id:', this.config.appId, '）');
-    } catch (err) {
-      console.error('[XFYun] 发送第一帧失败:', err);
-    }
-  }
-
-  /**
-   * 发送结束帧
-   */
-  sendEndFrame(): void {
-    if (!this.ws || !this.isConnected) return;
-
-    const frame = {
-      data: {
-        status: 2,
-        format: 'audio/L16;rate=16000',
-        audio: '',
-        encoding: 'raw',
-      },
-    };
-
-    try {
-      this.ws.send(JSON.stringify(frame));
-    } catch (err) {
-      console.error('[XFYun] 发送结束帧失败:', err);
-    }
-  }
-
-  /**
-   * 注册结果回调
-   */
-  onResult(callback: RecognitionCallback): void {
-    this.callback = callback;
-  }
-
-  /**
-   * 注册事件监听
-   */
-  onEvents(events: RecognitionEvents): void {
-    this.events = { ...this.events, ...events };
-  }
-
-  /**
-   * 关闭连接
-   */
-  close(): void {
-    this.isClosing = true;
-    this.stopHeartbeat();
-
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
-    this.sendEndFrame();
-
-    if (this.ws) {
-      this.ws.close(1000, '正常关闭');
-      this.ws = null;
-    }
-
-    this.isConnected = false;
-    this.audioQueue = [];
-    this.currentSegment = null;
-    console.log('[XFYun] 连接已关闭');
-  }
-
-  /**
-   * 获取统计信息
-   */
-  getStats(): RecognitionStats {
-    return { ...this.stats };
-  }
-
-  /**
-   * 重置统计
-   */
-  resetStats(): void {
-    this.stats = {
-      totalFrames: 0,
-      totalBytes: 0,
-      totalResults: 0,
-      averageLatency: 0,
-      lastLatency: 0,
-      errorCount: 0,
-      startTime: this.stats.startTime,
-    };
-  }
-
-  /**
-   * 处理WebSocket消息
-   */
-  private handleMessage(data: string | ArrayBuffer): void {
-    if (data instanceof ArrayBuffer) return;
-
-    try {
-      const response: XFYunResponse = JSON.parse(data);
-
-      if (response.code !== 0) {
-        console.error('[XFYun] 识别错误:', response.code, response.message);
-        this.stats.errorCount++;
-        this.handleErrorCode(response.code, response.message);
-        return;
-      }
-
-      if (!response.data?.result) return;
-
-      const result = response.data.result;
-      const status = response.data.status;
-      const sn = result.sn;
-      const pgs = result.pgs; // 修正类型：apd=追加, rpl=替换
-      const rg = result.rg;   // 替换范围
-
-      // 提取识别文本
-      const text = this.extractText(result);
-      const now = Date.now();
-      const isEnd = status === 2;
-      const isPartial = status === 1;
-      const isCorrection = pgs === 'rpl'; // 是否是修正结果
-
-      // 计算延迟
-      let latency = 0;
-      if (this.currentSegment && this.currentSegment.audioStartTime > 0) {
-        latency = now - this.currentSegment.audioStartTime;
-        this.updateLatency(latency);
-      }
-
-      // 更新当前段落追踪
-      if (this.currentSegment === null || (sn !== undefined && this.currentSegment.sn !== sn)) {
-        this.currentSegment = {
-          sn: sn ?? 0,
-          text: '',
-          lastUpdate: now,
-          audioStartTime: now,
         };
+      });
+    } catch (err: any) {
+      console.error('[XFYun AST] 连接失败:', err.message);
+      throw err;
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  /**
+   * 处理收到的 JSON 消息
+   * 文档格式:
+   *   握手: { action: "started", code: "0", sid: "xxx" }
+   *   结果: { msg_type: "result", res_type: "asr", data: { cn: { st: { rt: [...], type: "0" } }, ls: false } }
+   *   错误: { msg_type: "result", res_type: "frc", data: { desc: "..." } }
+   */
+  private handleMessage(data: string): void {
+    try {
+      const response = JSON.parse(data);
+      console.log('[XFYun AST] 收到消息:', JSON.stringify(response).substring(0, 400));
+
+      const action = response.action;
+      const msgType = response.msg_type;
+      const resType = response.res_type;
+      const code = response.code;
+      const sid = response.sid;
+
+      // === 握手成功 ===
+      if (action === 'started' && code === '0') {
+        this.sessionId = sid || '';
+        console.log('[XFYun AST] ✅ 握手成功, sessionId:', this.sessionId);
+        return;
       }
 
-      if (text) {
-        this.currentSegment.text = text;
-        this.currentSegment.lastUpdate = now;
+      // === 错误 (通用格式: action=error 或 res_type=frc) ===
+      if (action === 'error' || resType === 'frc') {
+        const desc = response.desc || response.data?.desc || '未知错误';
+        console.error('[XFYun AST] ❌ 服务端错误:', desc, '完整响应:', JSON.stringify(response));
+        this.stats.errorCount++;
+        this.events.onError?.(code || 'SERVER_ERROR', desc);
+        return;
       }
 
-      this.stats.totalResults++;
-
-      // 修正结果不增加 segmentId，保持与原句相同的 ID
-      if (!isCorrection) {
-        this.segmentId++;
+      // === 转写结果 (msg_type=result, res_type=asr) ===
+      if (msgType === 'result' && resType === 'asr') {
+        this.parseResult(response);
+        return;
       }
 
-      // 构造结果
-      const recognitionResult: RecognitionResult = {
-        text,
-        isEnd,
-        isPartial,
-        segmentId: isCorrection ? this.segmentId : this.segmentId,
-        timestamp: now,
-        latency,
-        sn,
-        pgs,
-        rg,
-        isCorrection,
-      };
+      // === 其他未知消息 ===
+      console.log('[XFYun AST] 未处理的消息格式:', JSON.stringify(response).substring(0, 200));
 
-      // 触发回调
-      this.callback?.(recognitionResult);
-
-      if (isCorrection) {
-        console.log('[XFYun] 检测到修正:', { sn, pgs, rg, text });
-      }
-
-      if (isPartial && !isCorrection) {
-        this.events.onPartialResult?.(recognitionResult);
-      } else if (isEnd) {
-        this.events.onFinalResult?.(recognitionResult);
-        // 最终结果后重置当前段落
-        this.currentSegment = null;
-      }
     } catch (err) {
-      console.error('[XFYun] 解析消息失败:', err);
+      console.error('[XFYun AST] 解析消息失败:', err);
+    }
+  }
+
+  /**
+   * 解析转写结果
+   * 文档格式:
+   * {
+   *   data: {
+   *     cn: { st: { rt: [{ ws: [{ cw: [{ w: "文字" }] }] }], type: "0", bg: 930, ed: 2590 } },
+   *     ls: false  // true=最终结果
+   *   }
+   * }
+   */
+  private parseResult(response: any): void {
+    const payload = response.data;
+    if (!payload) {
+      console.log('[XFYun AST] 结果中无 data 字段');
+      return;
+    }
+
+    // 检查异常结果 (data.normal === false)
+    if (payload.normal === false) {
+      console.error('[XFYun AST] 转写异常:', payload.desc || '未知异常');
       this.stats.errorCount++;
+      return;
     }
-  }
 
-  /**
-   * 更新延迟统计
-   */
-  private updateLatency(latency: number): void {
+    const cn = payload.cn;
+    if (!cn || !cn.st) {
+      console.log('[XFYun AST] 结果中无 cn.st 数据');
+      return;
+    }
+
+    const st = cn.st;
+    const typeStr = st.type; // "0"=最终结果, "1"=中间结果
+    const isFinal = payload.ls === true;
+    const isPartial = typeStr === '1';
+
+    // 提取文本
+    const text = this.extractText(st);
+    if (!text) {
+      return;
+    }
+
+    this.stats.totalResults++;
+    const latency = Date.now() - (this.stats.startTime || Date.now());
     this.stats.lastLatency = latency;
-    if (this.stats.totalResults === 0) {
-      this.stats.averageLatency = latency;
-    } else {
-      // 指数移动平均
-      const alpha = 0.3;
-      this.stats.averageLatency =
-        alpha * latency + (1 - alpha) * this.stats.averageLatency;
+    this.stats.averageLatency =
+      (this.stats.averageLatency * (this.stats.totalResults - 1) + latency) /
+      this.stats.totalResults;
+
+    const result: RecognitionResult = {
+      text,
+      isEnd: isFinal,
+      isPartial,
+      segmentId: this.segmentId,
+      timestamp: Date.now(),
+      latency,
+    };
+
+    console.log('[XFYun AST] 📝 转写:', text.substring(0, 60), isPartial ? '(中间)' : isFinal ? '(最终)' : '');
+
+    this.callback?.(result);
+
+    if (isPartial) {
+      this.events.onPartialResult?.(result);
+    }
+
+    if (isFinal) {
+      this.segmentId++;
+      this.events.onFinalResult?.(result);
     }
   }
 
   /**
    * 从识别结果中提取文本
+   * st.rt 是一个数组: rt: [{ ws: [{ cw: [{ w: "文字" }] }] }]
    */
-  private extractText(result: XFYunResponse['data']['result']): string {
-    if (!result?.ws) return '';
-    return result.ws.map((word) => word.cw.map((c) => c.w).join('')).join('');
-  }
-
-  /**
-   * 处理错误码
-   */
-  private handleErrorCode(code: number, message: string): void {
-    switch (code) {
-      case 10005:
-      case 10006:
-      case 10105:
-        this.events.onError?.(RecognitionError.AUTH_FAILED, '认证失败');
-        break;
-      case 10106:
-        this.events.onError?.(RecognitionError.AUTH_FAILED, '时间戳过期');
-        break;
-      case 10010:
-        this.events.onError?.(RecognitionError.QUOTA_EXCEEDED, '服务授权已过期');
-        break;
-      case 10019:
-      case 10020:
-      case 10021:
-        this.events.onError?.(RecognitionError.QUOTA_EXCEEDED, '试用额度已用完');
-        break;
-      case 10212:
-        this.events.onError?.(RecognitionError.SERVER_ERROR, '音频格式错误');
-        break;
-      case 20001:
-        this.events.onError?.(RecognitionError.SERVER_ERROR, '服务内部错误');
-        break;
-      case 20002:
-        this.events.onError?.(RecognitionError.TIMEOUT, '识别超时');
-        break;
-      case 20003:
-        this.events.onError?.(RecognitionError.SERVER_ERROR, '识别失败');
-        break;
-      default:
-        this.events.onError?.(RecognitionError.UNKNOWN, message || `错误码: ${code}`);
-    }
-  }
-
-  /**
-   * 调度重连
-   */
-  private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[XFYun] 达到最大重连次数');
-      this.events.onError?.(RecognitionError.CONNECTION_FAILED, '连接失败，请检查网络');
-      return;
+  private extractText(st: any): string {
+    const rt = st.rt;
+    if (!rt || !Array.isArray(rt)) {
+      console.warn('[XFYun AST] st.rt 不是数组:', typeof rt);
+      return '';
     }
 
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-    }
+    const words: string[] = [];
+    for (const segment of rt) {
+      const ws = segment.ws;
+      if (!ws || !Array.isArray(ws)) continue;
 
-    this.reconnectAttempts++;
-    const delay = this.RECONNECT_DELAY * this.reconnectAttempts;
+      for (const word of ws) {
+        const cw = word.cw;
+        if (!cw || !Array.isArray(cw)) continue;
 
-    console.log(`[XFYun] ${delay}ms后尝试重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-
-    this.reconnectTimer = setTimeout(() => {
-      this.connect().catch((err) => {
-        console.error('[XFYun] 重连失败:', err);
-      });
-    }, delay);
-  }
-
-  /**
-   * 清空音频队列
-   */
-  private flushAudioQueue(): void {
-    if (this.audioQueue.length === 0) return;
-
-    console.log(`[XFYun] 清空音频队列，共${this.audioQueue.length}帧`);
-    const queue = [...this.audioQueue];
-    this.audioQueue = [];
-
-    queue.forEach((audioData) => {
-      this.sendAudio(audioData);
-    });
-  }
-
-  /**
-   * 启动心跳
-   */
-  private startHeartbeat(): void {
-    this.stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
-      if (this.ws && this.isConnected) {
-        try {
-          this.ws.send('ping');
-        } catch {
-          // 忽略心跳失败
+        for (const char of cw) {
+          if (char.w) {
+            words.push(char.w);
+          }
         }
       }
-    }, this.HEARTBEAT_INTERVAL);
+    }
+
+    return words.join('');
   }
 
   /**
-   * 停止心跳
+   * 发送音频数据 (二进制 PCM16)
+   * 文档建议: 每 40ms 发送 1280 字节
    */
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
+  async sendAudio(audioData: ArrayBuffer): Promise<void> {
+    if (!this.ws || !this.isConnected) {
+      console.warn('[XFYun AST] WebSocket 未连接 (ws:', !!this.ws, 'connected:', this.isConnected, 'connecting:', this.connecting, ')');
+
+      // 清理死连接
+      if (this.ws && !this.isConnected && !this.connecting) {
+        try { this.ws.close(); } catch {}
+        this.ws = null;
+      }
+
+      // 尝试新建连接
+      if (!this.ws && !this.connecting) {
+        try {
+          await this.connect();
+        } catch (err: any) {
+          console.error('[XFYun AST] 自动连接失败:', err.message);
+          return;
+        }
+      }
+
+      if (!this.isConnected) {
+        console.warn('[XFYun AST] 连接未就绪，丢弃音频帧 (connecting:', this.connecting, ')');
+        return;
+      }
+    }
+
+    try {
+      this.ws!.send(audioData);
+      this.stats.totalFrames++;
+      this.stats.totalBytes += audioData.byteLength;
+    } catch (err: any) {
+      console.error('[XFYun AST] 发送音频失败:', err.message);
+      this.isConnected = false;
+      this.ws = null;
     }
   }
 
   /**
-   * 获取连接状态
+   * 发送结束标识
+   * 文档格式: {"end": true, "sessionId": "xxx"}
    */
-  getIsConnected(): boolean {
-    return this.isConnected;
+  endSession(): void {
+    if (this.ws && this.isConnected && this.sessionId) {
+      try {
+        const endMessage = JSON.stringify({
+          end: true,
+          sessionId: this.sessionId,
+        });
+        this.ws.send(endMessage);
+        console.log('[XFYun AST] 已发送结束标识, sessionId:', this.sessionId);
+      } catch (err) {
+        console.error('[XFYun AST] 发送结束标识失败:', err);
+      }
+    }
+  }
+
+  close(): void {
+    this.endSession();
+    if (this.ws) {
+      this.ws.close(1000, '正常关闭');
+      this.ws = null;
+    }
+    this.isConnected = false;
+    this.connecting = false;
+    console.log('[XFYun AST] 连接已关闭');
+  }
+
+  onResult(callback: RecognitionCallback): void {
+    this.callback = callback;
+  }
+
+  setEvents(events: RecognitionEvents): void {
+    this.events = events;
+  }
+
+  getStats(): RecognitionStats {
+    return { ...this.stats };
+  }
+
+  isReady(): boolean {
+    return this.isConnected && this.ws !== null;
   }
 }

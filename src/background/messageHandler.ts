@@ -1,20 +1,23 @@
 import { XFYunRecognition } from '@/services/xfyun/recognition';
 import { AliyunTranslation } from '@/services/aliyun/translation';
+import { AliyunTTS } from '@/services/aliyun/tts';
 import { Corrector } from '@/services/corrector';
 import { AppSettings, SubtitleEntry, RecognitionResult } from '@/types';
 import { generateId } from '@/utils/storage';
 
 /**
  * 消息处理器
- * 协调语音识别、翻译、修正和UI更新
+ * 协调语音识别、翻译、修正、TTS播报和UI更新
  */
 export class MessageHandler {
   private xfyunRecognition: XFYunRecognition | null = null;
   private aliyunTranslation: AliyunTranslation | null = null;
+  private aliyunTTS: AliyunTTS | null = null;
   private corrector: Corrector;
   private tabId: number | null = null; // 目标标签页ID
   private segmentCount = 0;
   private pendingSegments: Map<number, { text: string; id: string }> = new Map(); // 待翻译的句子
+  private lastSpokenText: string = ''; // 上次播报的文本，避免重复播报
 
   constructor(tabId?: number) {
     this.corrector = new Corrector();
@@ -22,37 +25,17 @@ export class MessageHandler {
   }
 
   /**
-   * 将源语言转换为讯飞语言代码
+   * 将源语言转换为讯飞 AST API 语言代码
+   * AST API 的 lang 参数仅支持: autodialect (中英+方言), autominor (37语种)
    */
   private convertToXfyunLanguage(sourceLanguage: string): string {
-    // 讯飞支持的语言代码映射
-    const languageMap: Record<string, string> = {
-      'en': 'en_us',      // 英语
-      'en-US': 'en_us',
-      'zh': 'zh_cn',      // 中文
-      'zh-CN': 'zh_cn',
-      'ja': 'ja_jp',      // 日语
-      'ja-JP': 'ja_jp',
-      'ko': 'ko_kr',      // 韩语
-      'ko-KR': 'ko_kr',
-      'ru': 'ru_ru',      // 俄语
-      'ru-RU': 'ru_ru',
-      'es': 'es_es',      // 西班牙语
-      'es-ES': 'es_es',
-      'fr': 'fr_fr',      // 法语
-      'fr-FR': 'fr_fr',
-      'de': 'de_de',      // 德语
-      'de-DE': 'de_de',
-      'ar': 'ar_ar',      // 阿拉伯语
-      'ar-SA': 'ar_ar',
-      'pt': 'pt_pt',      // 葡萄牙语
-      'pt-PT': 'pt_pt',
-      'vi': 'vi_vn',      // 越南语
-      'vi-VN': 'vi_vn',
-      'th': 'th_th',      // 泰语
-      'th-TH': 'th_th',
-    };
-    return languageMap[sourceLanguage] || 'en_us'; // 默认英文
+    // 中英文使用 autodialect（免费，支持中英+202种方言）
+    if (sourceLanguage === 'zh' || sourceLanguage === 'zh-CN' ||
+        sourceLanguage === 'en' || sourceLanguage === 'en-US') {
+      return 'autodialect';
+    }
+    // 其他语种使用 autominor（付费功能，支持37语种免切识别）
+    return 'autominor';
   }
 
   /**
@@ -67,6 +50,10 @@ export class MessageHandler {
    */
   async onAudioData(audioData: ArrayBuffer, settings: AppSettings): Promise<void> {
     console.log('[MessageHandler] 收到音频数据, xfyunRecognition:', !!this.xfyunRecognition);
+    console.log('[MessageHandler] 阿里云配置:', {
+      accessKeyId: settings.aliyun?.accessKeyId ? '已配置' : '未配置',
+      accessKeySecret: settings.aliyun?.accessKeySecret ? '已配置' : '未配置',
+    });
 
     if (!this.xfyunRecognition) {
       console.log('[MessageHandler] 初始化讯飞识别...');
@@ -80,6 +67,21 @@ export class MessageHandler {
 
       this.xfyunRecognition = new XFYunRecognition(xfyunConfig);
       this.aliyunTranslation = new AliyunTranslation(settings.aliyun);
+      
+      // 初始化 TTS（如果启用语音播报）
+      if (settings.features?.outputMode === 'voice' || settings.features?.outputMode === 'both') {
+        this.aliyunTTS = new AliyunTTS(settings.aliyun);
+        // 设置 TTS 参数
+        if (settings.features?.ttsSpeed) {
+          this.aliyunTTS.setSpeed(settings.features.ttsSpeed);
+        }
+        if (settings.features?.ttsVolume) {
+          this.aliyunTTS.setVolume(settings.features.ttsVolume);
+        }
+        console.log('[MessageHandler] TTS 初始化完成, 模式:', settings.features?.outputMode);
+      }
+      
+      console.log('[MessageHandler] 阿里云翻译初始化完成');
 
       // 设置识别回调
       this.xfyunRecognition.onResult((result) => {
@@ -180,35 +182,62 @@ export class MessageHandler {
       return;
     }
 
-    // 如果是最终结果，进行翻译
-    if (isEnd && this.aliyunTranslation) {
-      console.log('[MessageHandler] 最终结果，开始翻译');
+    // 如果是最终结果或中间结果较长，进行翻译
+    const shouldTranslate = isEnd || (text.length > 10 && !isCorrection);
+
+    if (shouldTranslate && this.aliyunTranslation) {
+      console.log('[MessageHandler] 开始翻译, isEnd:', isEnd, 'textLength:', text.length);
       try {
         const translated = await this.aliyunTranslation.translate(text, settings);
-        this.segmentCount++;
 
-        const id = generateId();
+        if (isEnd) {
+          this.segmentCount++;
+        }
+
+        const id = isEnd ? generateId() : `partial_${segmentId}`;
         const entry: SubtitleEntry = {
           id,
           original: text,
           translated,
-          isEnd: true,
+          isEnd,
           timestamp: Date.now(),
         };
 
         // 记录 sn 到 pendingSegments（用于修正）
-        if (sn !== undefined) {
+        if (isEnd && sn !== undefined) {
           this.pendingSegments.set(sn, { text, id });
         }
 
-        this.corrector.addToHistory(entry);
+        if (isEnd) {
+          this.corrector.addToHistory(entry);
+        }
         this.sendSubtitleToContent(entry);
+
+        // TTS 语音播报（仅在最终结果时播报，避免重复）
+        if (isEnd && translated && this.aliyunTTS && translated !== this.lastSpokenText) {
+          this.lastSpokenText = translated;
+          console.log('[MessageHandler] 开始 TTS 播报:', translated.substring(0, 30));
+          try {
+            await this.aliyunTTS.speak(translated);
+            console.log('[MessageHandler] TTS 播报完成');
+          } catch (ttsErr) {
+            console.error('[MessageHandler] TTS 播报失败:', ttsErr);
+          }
+        }
       } catch (err) {
         console.error('[MessageHandler] 翻译失败:', err);
+        // 翻译失败时也显示原文
+        this.sendSubtitleToContent({
+          id: `partial_${segmentId}`,
+          original: text,
+          translated: '',
+          isEnd: false,
+          timestamp: Date.now(),
+        });
       }
-    } else if (!isEnd) {
-      // 中间结果，先显示原文
-      console.log('[MessageHandler] 中间结果，发送原文');
+    } else if (!isEnd && text.length <= 10) {
+      // 短文本中间结果，先显示原文
+      console.log('[MessageHandler] 短文本中间结果，发送原文');
       this.sendSubtitleToContent({
         id: `partial_${segmentId}`,
         original: text,
@@ -248,8 +277,14 @@ export class MessageHandler {
       this.xfyunRecognition.close();
       this.xfyunRecognition = null;
     }
+    if (this.aliyunTTS) {
+      this.aliyunTTS.stop();
+      this.aliyunTTS.clear();
+      this.aliyunTTS = null;
+    }
     this.aliyunTranslation = null;
     this.corrector.clear();
     this.segmentCount = 0;
+    this.lastSpokenText = '';
   }
 }

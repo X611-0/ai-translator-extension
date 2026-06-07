@@ -10,7 +10,6 @@ import { AliyunConfig, TranslationResult } from '@/types';
 const API_ENDPOINT = 'https://mt.cn-hangzhou.aliyuncs.com/';
 const API_VERSION = '2018-10-12';
 const ACTION_GENERAL = 'TranslateGeneral';
-const ACTION_BATCH = 'TranslateBatch';
 const ACTION_GET_QUOTA = 'GetTranslateQuota';
 
 // 支持的语言代码映射
@@ -153,6 +152,7 @@ async function buildRequestUrl(
     Action: action,
     Version: API_VERSION,
     Format: 'JSON',
+    FormatType: 'text', // 添加 FormatType 参数
     AccessKeyId: config.accessKeyId,
     SignatureMethod: 'HMAC-SHA1',
     SignatureVersion: '1.0',
@@ -372,6 +372,7 @@ export async function translateSingle(
 
 /**
  * 批量翻译
+ * 阿里云机器翻译批量接口使用 TranslateGeneral + JSON 数组
  */
 export async function translateBatch(
   config: AliyunConfig,
@@ -380,39 +381,19 @@ export async function translateBatch(
   targetLanguage: string = 'zh',
   useContext: boolean = false
 ): Promise<string[]> {
-  // 过滤空文本和已缓存的
-  const results: string[] = new Array(texts.length);
-  const toTranslate: { index: number; text: string }[] = [];
+  // 过滤空文本
+  const nonEmpty = texts.filter(t => t.trim());
+  if (nonEmpty.length === 0) {
+    return texts.map(() => '');
+  }
 
   const context = useContext ? getContextText() : undefined;
 
-  texts.forEach((text, index) => {
-    if (!text.trim()) {
-      results[index] = '';
-      return;
-    }
-
-    const cacheKey = buildContextKey(sourceLanguage, targetLanguage, text, context);
-    const cached = translationCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_EXPIRY) {
-      results[index] = cached.translated;
-      stats.cacheHits++;
-      return;
-    }
-
-    toTranslate.push({ index, text });
-  });
-
-  if (toTranslate.length === 0) {
-    return results;
-  }
-
-  // 构造批量请求
-  const batchTexts = toTranslate.map(item => item.text);
+  // 批量翻译：使用 TranslateGeneral，SourceText 为 JSON 数组
   const params: Record<string, string> = {
     SourceLanguage: LANGUAGE_MAP[sourceLanguage] || sourceLanguage,
     TargetLanguage: LANGUAGE_MAP[targetLanguage] || targetLanguage,
-    SourceText: JSON.stringify(batchTexts),
+    SourceText: JSON.stringify(nonEmpty),
     Scene: 'general',
   };
 
@@ -420,10 +401,10 @@ export async function translateBatch(
     params.Context = context;
   }
 
-  const url = await buildRequestUrl(config, ACTION_BATCH, params);
+  const url = await buildRequestUrl(config, ACTION_GENERAL, params);
 
   stats.totalRequests++;
-  stats.totalCharacters += batchTexts.reduce((sum, t) => sum + t.length, 0);
+  stats.totalCharacters += nonEmpty.reduce((sum, t) => sum + t.length, 0);
 
   try {
     const response = await fetch(url);
@@ -435,41 +416,47 @@ export async function translateBatch(
       throw new Error(errorMsg);
     }
 
-    stats.successCount += toTranslate.length;
+    stats.successCount += nonEmpty.length;
 
-    // 解析批量结果
-    const translatedList = data.Data?.TranslatedList || [];
-    translatedList.forEach((item: { translated: string }, i: number) => {
-      const { index, text } = toTranslate[i];
-      results[index] = item.translated || '';
+    // 解析结果 - 可能返回单个翻译或数组
+    const resultList = data.Data?.TranslatedList || data.Data?.Translated;
+    const translations = Array.isArray(resultList) ? resultList : [resultList];
 
-      // 缓存结果
-      const cacheKey = buildContextKey(sourceLanguage, targetLanguage, text, context);
-      translationCache.set(cacheKey, {
-        translated: results[index],
-        timestamp: Date.now(),
-        contextKey: context,
-      });
-
-      // 更新上下文
-      if (useContext) {
-        updateContextWindow(text, results[index]);
+    // 构建结果数组，保持原始顺序
+    const results: string[] = [];
+    let ti = 0;
+    texts.forEach((text) => {
+      if (!text.trim()) {
+        results.push('');
+      } else {
+        const translated = translations[ti] || text;
+        results.push(translated);
+        // 缓存
+        const cacheKey = buildContextKey(sourceLanguage, targetLanguage, text, context);
+        translationCache.set(cacheKey, { translated, timestamp: Date.now(), contextKey: context });
+        if (useContext) updateContextWindow(text, translated);
+        ti++;
       }
     });
 
     return results;
   } catch (err) {
-    console.error('[Aliyun] 批量翻译失败:', err);
-    // 失败时逐条翻译
-    for (const { index, text } of toTranslate) {
+    console.error('[Aliyun] 批量翻译失败，降级为逐条翻译:', err);
+    // 逐条翻译作为降级
+    const fallbackResults: string[] = [];
+    for (let i = 0; i < texts.length; i++) {
+      if (!texts[i].trim()) {
+        fallbackResults.push('');
+        continue;
+      }
       try {
-        const result = await translateSingle(config, text, sourceLanguage, targetLanguage, 0, useContext);
-        results[index] = result.translated;
+        const result = await translateSingle(config, texts[i], sourceLanguage, targetLanguage, 0, useContext);
+        fallbackResults.push(result.translated);
       } catch {
-        results[index] = text; // 失败时返回原文
+        fallbackResults.push(texts[i]);
       }
     }
-    return results;
+    return fallbackResults;
   }
 }
 

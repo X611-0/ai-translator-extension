@@ -10,6 +10,7 @@ export interface XFYunConfig {
 export interface AliyunConfig {
   accessKeyId: string;
   accessKeySecret: string;
+  ttsAppKey?: string;   // 智能语音交互 NLS 项目的 AppKey（需在 nls.console.aliyun.com 创建项目获取）
 }
 
 export interface AppSettings {
@@ -109,6 +110,7 @@ export type MessageType =
   | 'UPDATE_SETTINGS'
   | 'GET_SETTINGS'
   | 'CONTENT_SCRIPT_READY'
+  | 'TEST_ALIYUN_API'
   | 'ERROR';
 
 export interface ExtensionMessage {
